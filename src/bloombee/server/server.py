@@ -187,8 +187,11 @@ class Server:
         ]
 
         if reachable_via_relay is None:
-            is_reachable = check_direct_reachability(initial_peers=initial_peers, use_relay=False, **kwargs)
-            reachable_via_relay = is_reachable is False  # if can't check reachability (returns None), run a full peer
+            if skip_reachability_check:
+                reachable_via_relay = False
+            else:
+                is_reachable = check_direct_reachability(initial_peers=initial_peers, use_relay=False, **kwargs)
+                reachable_via_relay = is_reachable is False  # if can't check reachability (returns None), run a full peer
             logger.info(f"This server is accessible {'via relays' if reachable_via_relay else 'directly'}")
         self.dht = DHT(
             initial_peers=initial_peers,

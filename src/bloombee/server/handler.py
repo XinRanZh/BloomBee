@@ -2372,6 +2372,16 @@ class TransformerConnectionHandler(ConnectionHandler):
             rpc_request = runtime_pb2.ExpertRequest(uid=next_uid, tensors=next_tensors, metadata=serialized_next_metadata)
 
             nic2nic_start = perf_counter()
+
+            # Synthetic network delay injection (E2-E5 environments)
+            _syn_bw = os.environ.get("BLOOMBEE_SYNTHETIC_S2S_BANDWIDTH_MBPS")
+            _syn_lat = os.environ.get("BLOOMBEE_SYNTHETIC_S2S_BASE_LATENCY_MS")
+            if _syn_bw is not None or _syn_lat is not None:
+                _bw_bytes_per_sec = float(_syn_bw) * 125_000 if _syn_bw else float("inf")
+                _base_lat_sec = float(_syn_lat) / 1000.0 if _syn_lat else 0.0
+                _transfer_delay = push_tensor_bytes / _bw_bytes_per_sec + _base_lat_sec
+                await asyncio.sleep(_transfer_delay)
+
             response = await stub.rpc_push(rpc_request, timeout=self.request_timeout)
             nic2nic_end = perf_counter()
             sender_ack_us = self._now_us()

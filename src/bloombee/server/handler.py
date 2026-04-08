@@ -1823,6 +1823,15 @@ class TransformerConnectionHandler(ConnectionHandler):
                 except Exception:
                     pass
 
+            # Synthetic network delay injection for micro-batch push (E2-E5)
+            _syn_bw = os.environ.get("BLOOMBEE_SYNTHETIC_S2S_BANDWIDTH_MBPS")
+            _syn_lat = os.environ.get("BLOOMBEE_SYNTHETIC_S2S_BASE_LATENCY_MS")
+            if _syn_bw is not None or _syn_lat is not None:
+                _bw_bytes_per_sec = float(_syn_bw) * 125_000 if _syn_bw else float("inf")
+                _base_lat_sec = float(_syn_lat) / 1000.0 if _syn_lat else 0.0
+                _transfer_delay = wire_bytes / _bw_bytes_per_sec + _base_lat_sec
+                await asyncio.sleep(_transfer_delay)
+
             response = await stub.rpc_push(request, timeout=self.request_timeout)
             sender_ack_us = self._now_us()
             rpc_timing = self._extract_rpc_push_timing(

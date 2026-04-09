@@ -303,18 +303,26 @@ class _ServerInferenceSession:
     async def _step(self, inputs_serialized: runtime_pb2.ExpertRequest) -> runtime_pb2.ExpertResponse:
         """Inference step on serialized data. This code is meant to be run inside RemoteExpertWorker"""
 
-        # Synthetic delay for client→downstream server (simulates WAN for non-first stages).
-        # Without this, the client's direct LAN path to S2 races and always beats the
-        # delayed S1→S2 push, making synthetic delay experiments invalid.
-        if self.span.start > 0:
-            _syn_bw = os.environ.get("BLOOMBEE_SYNTHETIC_S2S_BANDWIDTH_MBPS")
-            _syn_lat = os.environ.get("BLOOMBEE_SYNTHETIC_S2S_BASE_LATENCY_MS")
-            if _syn_bw is not None or _syn_lat is not None:
-                _bw_bytes_per_sec = float(_syn_bw) * 125_000 if _syn_bw else float("inf")
-                _base_lat_sec = float(_syn_lat) / 1000.0 if _syn_lat else 0.0
-                _payload_bytes = sum(len(t.buffer) for t in inputs_serialized.tensors)
-                _transfer_delay = _payload_bytes / _bw_bytes_per_sec + _base_lat_sec
-                await asyncio.sleep(_transfer_delay)
+        # Synthetic delay for client→remote server (simulates WAN crossing).
+        # The benchmark client runs on the LAST server's pod. In a real WAN setup,
+        # client↔remote_server traffic crosses the delayed link. Only the local
+        # server (where the client runs) has no network delay.
+        #
+        # BLOOMBEE_CLIENT_COLOCATED_BLOCKS: "start:end" of the local server span
+        # (e.g., "16:32" for Falcon S2, "24:32" for Mixtral S4).
+        # If set, delay all servers EXCEPT the matching span. If not set, no delay.
+        _colocated = os.environ.get("BLOOMBEE_CLIENT_COLOCATED_BLOCKS")
+        if _colocated is not None:
+            _is_local = f"{self.span.start}:{self.span.end}" == _colocated
+            if not _is_local:
+                _syn_bw = os.environ.get("BLOOMBEE_SYNTHETIC_S2S_BANDWIDTH_MBPS")
+                _syn_lat = os.environ.get("BLOOMBEE_SYNTHETIC_S2S_BASE_LATENCY_MS")
+                if _syn_bw is not None or _syn_lat is not None:
+                    _bw_bytes_per_sec = float(_syn_bw) * 125_000 if _syn_bw else float("inf")
+                    _base_lat_sec = float(_syn_lat) / 1000.0 if _syn_lat else 0.0
+                    _payload_bytes = sum(len(t.buffer) for t in inputs_serialized.tensors)
+                    _transfer_delay = _payload_bytes / _bw_bytes_per_sec + _base_lat_sec
+                    await asyncio.sleep(_transfer_delay)
 
         await self._inputs_queue.put(inputs_serialized)
         self.stepped = True

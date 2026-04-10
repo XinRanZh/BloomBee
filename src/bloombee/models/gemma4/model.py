@@ -6,15 +6,11 @@ from hivemind import DHT
 from hivemind.utils.logging import get_logger
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
-try:
-    from transformers.models.gemma4.modeling_gemma4 import (
-        Gemma4ForCausalLM,
-        Gemma4PreTrainedModel,
-        Gemma4TextModel,
-    )
-    _HAS_NATIVE_GEMMA4 = True
-except ImportError:
-    _HAS_NATIVE_GEMMA4 = False
+from transformers.models.gemma4.modeling_gemma4 import (
+    Gemma4ForCausalLM,
+    Gemma4PreTrainedModel,
+    Gemma4TextModel,
+)
 
 from bloombee.client.from_pretrained import FromPretrainedMixin
 from bloombee.client.lm_head import LMHead
@@ -25,9 +21,6 @@ from bloombee.models.gemma4.config import DistributedGemma4Config
 from bloombee.utils.auto_config import DefaultRevisionMixin
 
 logger = get_logger(__name__)
-
-if not _HAS_NATIVE_GEMMA4:
-    raise ImportError("Gemma4 support requires transformers >= 5.0")
 
 
 class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixin, Gemma4TextModel):

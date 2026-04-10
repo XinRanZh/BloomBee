@@ -3,21 +3,11 @@ from typing import Optional, Tuple
 import torch
 from transformers.cache_utils import DynamicCache
 
-try:
-    from transformers.models.gemma4.modeling_gemma4 import (
-        Gemma4TextDecoderLayer,
-        Gemma4TextConfig,
-        Gemma4TextRotaryEmbedding,
-    )
-    _HAS_NATIVE_GEMMA4 = True
-except ImportError:
-    _HAS_NATIVE_GEMMA4 = False
-
-if not _HAS_NATIVE_GEMMA4:
-    raise ImportError(
-        "Gemma4 support requires transformers >= 5.0 with native Gemma4 classes. "
-        "Install with: pip install 'transformers>=5.0'"
-    )
+from transformers.models.gemma4.modeling_gemma4 import (
+    Gemma4TextDecoderLayer,
+    Gemma4TextConfig,
+    Gemma4TextRotaryEmbedding,
+)
 
 
 class WrappedGemma4Block(Gemma4TextDecoderLayer):

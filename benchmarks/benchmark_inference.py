@@ -81,8 +81,11 @@ def main():
 
 @torch.inference_mode()
 def benchmark_inference(process_idx, args, result_pipe):
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-    # Using use_fast=False since LlamaTokenizerFast takes a long time to start, and we decode 1 token at a time anyway
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    except (TypeError, Exception):
+        # Some models (e.g., Gemma4) only support the fast tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     
     # Set pad_token for LLaMA tokenizer (required for batch padding)
     if tokenizer.pad_token is None:

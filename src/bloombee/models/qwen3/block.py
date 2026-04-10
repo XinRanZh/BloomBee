@@ -62,14 +62,10 @@ class WrappedQwen3Block(_BaseDecoderLayer):
             past_key_value.value_cache = [torch.empty(0) for _ in range(self.layer_idx)] + [_past_key_value[1]]
             past_key_value._seen_tokens = past_key_values_length
         elif use_cache:
-            # transformers 4.36+: must pass a DynamicCache (even empty) to get KV cache back.
-            # Passing past_key_value=None returns None as present_key_value.
-            # Also, DynamicCache.update() appends when len(key_cache) <= layer_idx, so we
-            # pre-populate with None placeholders for layers 0..layer_idx-1 to ensure
-            # key_cache[layer_idx] is accessible after the first update() call.
+            # transformers 4.36+: must pass a DynamicCache to get KV cache back.
+            # DynamicCache.update() appends when len(key_cache) <= layer_idx.
+            # We do NOT pre-fill: let update() handle the indexing naturally.
             past_key_value = DynamicCache()
-            past_key_value.key_cache = [None] * self.layer_idx
-            past_key_value.value_cache = [None] * self.layer_idx
 
         if self._attn_implementation == "flash_attention_2":
             # 2d mask is passed through the layers
@@ -120,15 +116,16 @@ class WrappedQwen3Block(_BaseDecoderLayer):
         else:
             output_hidden = outputs
 
-        if use_cache and past_key_value is not None:
-            # Read cache from the DynamicCache object directly (in-place updated by attention).
-            # Works for both tf 4.x (returns in outputs[-1]) and tf 4.49+ (in-place only).
+        if use_cache and past_key_value is not None and hasattr(past_key_value, 'key_cache'):
+            # Read cache from DynamicCache (in-place updated by attention).
+            # After update(), the new KV is at the LAST index (appended).
             pk = pv = None
-            if hasattr(past_key_value, 'key_cache') and self.layer_idx < len(past_key_value.key_cache):
-                pk_candidate = past_key_value.key_cache[self.layer_idx]
-                if pk_candidate is not None and pk_candidate.dim() == 4:
-                    pk = pk_candidate
-                    pv = past_key_value.value_cache[self.layer_idx]
+            for i in range(len(past_key_value.key_cache) - 1, -1, -1):
+                t = past_key_value.key_cache[i]
+                if t is not None and t.dim() == 4:
+                    pk = t
+                    pv = past_key_value.value_cache[i]
+                    break
             if pk is not None:
                 pk = pk[:, :, past_key_values_length:, :]
                 pv = pv[:, :, past_key_values_length:, :]

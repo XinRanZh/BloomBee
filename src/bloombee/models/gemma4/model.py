@@ -133,17 +133,17 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         return self.norm
 
 
-class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Gemma4ForCausalLM):
+class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, nn.Module):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
 
     config_class = DistributedGemma4Config
 
     def __init__(self, config: DistributedGemma4Config):
-        Gemma4PreTrainedModel.__init__(self, config)
+        nn.Module.__init__(self)
+        self.config = config
         self.model = DistributedGemma4Model(config)
         self.lm_head = LMHead(config)
-        self.post_init()
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -153,18 +153,18 @@ class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, G
         return self.model
 
 
-class DistributedGemma4ForSequenceClassification(FromPretrainedMixin, Gemma4PreTrainedModel):
+class DistributedGemma4ForSequenceClassification(FromPretrainedMixin, nn.Module):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
 
     config_class = DistributedGemma4Config
 
     def __init__(self, config: DistributedGemma4Config):
-        Gemma4PreTrainedModel.__init__(self, config)
+        nn.Module.__init__(self)
+        self.config = config
         self.num_labels = config.num_labels
         self.model = DistributedGemma4Model(config)
         self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
-        self.post_init()
 
     @property
     def transformer(self) -> DistributedGemma4Model:

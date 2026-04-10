@@ -61,6 +61,9 @@ class WrappedQwen3Block(_BaseDecoderLayer):
         past_key_values_length = 0
 
         # --- Convert BloomBee's layer_past to HF DynamicCache ---
+        # tf 5.x DynamicCache: attention calls cache.update(k, v, layer_idx).
+        # update() appends when layer_idx >= len(key_cache), or cat when layer_idx < len.
+        # We DON'T pre-fill with placeholders — just let update() append naturally.
         past_key_values = None
         if layer_past is not None:
             pk, pv = layer_past
@@ -69,14 +72,18 @@ class WrappedQwen3Block(_BaseDecoderLayer):
                 pv = pv.to(device=hidden_states.device, dtype=hidden_states.dtype)
             past_key_values_length = pk.shape[2]
             pk, pv = self._reorder_cache_from_bloom((pk, pv), batch_size, past_key_values_length)
+            # Use DynamicCache.from_legacy_cache() style: set layer_idx directly
             past_key_values = DynamicCache()
-            past_key_values.key_cache = [torch.empty(0, device=pk.device, dtype=pk.dtype) for _ in range(self.layer_idx)] + [pk]
-            past_key_values.value_cache = [torch.empty(0, device=pv.device, dtype=pv.dtype) for _ in range(self.layer_idx)] + [pv]
+            # Pad with None to ensure key_cache[layer_idx] exists
+            while len(past_key_values.key_cache) <= self.layer_idx:
+                past_key_values.key_cache.append(None)
+                past_key_values.value_cache.append(None)
+            past_key_values.key_cache[self.layer_idx] = pk
+            past_key_values.value_cache[self.layer_idx] = pv
             past_key_values._seen_tokens = past_key_values_length
         elif use_cache:
+            # Empty cache — don't pre-fill, let attention's update() append
             past_key_values = DynamicCache()
-            past_key_values.key_cache = [torch.empty(0, device=hidden_states.device, dtype=hidden_states.dtype) for _ in range(self.layer_idx)]
-            past_key_values.value_cache = [torch.empty(0, device=hidden_states.device, dtype=hidden_states.dtype) for _ in range(self.layer_idx)]
 
         # --- Use position_ids from backend if provided, otherwise compute ---
         position_ids = kwargs.pop("position_ids", None)
@@ -136,25 +143,31 @@ class WrappedQwen3Block(_BaseDecoderLayer):
 
         # --- Extract updated cache and convert back to BloomBee format ---
         if use_cache and past_key_values is not None:
-            # In tf 5.x, DynamicCache.update() appends to key_cache/value_cache.
-            # Find the actual KV entry (skip empty placeholders).
+            # After super().forward(), attention called cache.update(k, v, self.layer_idx).
+            # Try to read from layer_idx first, then scan for any valid 4D tensor.
             pk = pv = None
-            for i in range(len(past_key_values.key_cache) - 1, -1, -1):
-                t = past_key_values.key_cache[i]
-                if t.dim() == 4:  # Valid [B, H, S, D] tensor
+            # Try direct index
+            if self.layer_idx < len(past_key_values.key_cache):
+                t = past_key_values.key_cache[self.layer_idx]
+                if t is not None and t.dim() == 4:
                     pk = t
-                    pv = past_key_values.value_cache[i]
-                    break
+                    pv = past_key_values.value_cache[self.layer_idx]
+            # Fallback: scan backwards
+            if pk is None:
+                for i in range(len(past_key_values.key_cache) - 1, -1, -1):
+                    t = past_key_values.key_cache[i]
+                    if t is not None and t.dim() == 4:
+                        pk = t
+                        pv = past_key_values.value_cache[i]
+                        break
             if pk is not None:
                 # Only keep NEW tokens (BloomBee manages cumulative cache externally)
                 pk = pk[:, :, past_key_values_length:, :]
                 pv = pv[:, :, past_key_values_length:, :]
                 present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
                 return (output_hidden, present_key_value)
-            # No valid KV found — return empty cache
-            empty_k = torch.empty(0, device=hidden_states.device, dtype=hidden_states.dtype)
-            return (output_hidden, (empty_k, empty_k))
 
+        # Always return 2-tuple for backend compatibility
         return (output_hidden, None)
 
     def _reorder_cache_from_bloom(

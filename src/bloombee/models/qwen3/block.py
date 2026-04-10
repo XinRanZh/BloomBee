@@ -112,18 +112,30 @@ class WrappedQwen3Block(_BaseDecoderLayer):
             **{k: v for k, v in kwargs.items() if k not in ('position_ids', 'attention_mask', 'use_cache')}
         )
 
-        if use_cache:
-            present_key_value = outputs[-1]
-            pk, pv = present_key_value[self.layer_idx]  # [B, H, S_full, D]
-            # Only keep new tokens (analogous to Falcon fix #8):
-            # Qwen2Attention returns full K,V (past + new), but BloomBee's
-            # update_cache writes from prefix_length, so we only need new tokens.
-            pk = pk[:, :, past_key_values_length:, :]
-            pv = pv[:, :, past_key_values_length:, :]
-            present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
-            outputs = outputs[:-1] + (present_key_value,)
+        # Extract hidden_states from outputs (may be tensor or tuple)
+        if isinstance(outputs, torch.Tensor):
+            output_hidden = outputs
+        elif isinstance(outputs, tuple):
+            output_hidden = outputs[0]
+        else:
+            output_hidden = outputs
 
-        return outputs
+        if use_cache and past_key_value is not None:
+            # Read cache from the DynamicCache object directly (in-place updated by attention).
+            # Works for both tf 4.x (returns in outputs[-1]) and tf 4.49+ (in-place only).
+            pk = pv = None
+            if hasattr(past_key_value, 'key_cache') and self.layer_idx < len(past_key_value.key_cache):
+                pk_candidate = past_key_value.key_cache[self.layer_idx]
+                if pk_candidate is not None and pk_candidate.dim() == 4:
+                    pk = pk_candidate
+                    pv = past_key_value.value_cache[self.layer_idx]
+            if pk is not None:
+                pk = pk[:, :, past_key_values_length:, :]
+                pv = pv[:, :, past_key_values_length:, :]
+                present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
+                return (output_hidden, present_key_value)
+
+        return (output_hidden, None)
 
     def _reorder_cache_from_bloom(
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int

@@ -5,12 +5,20 @@ import torch.nn as nn
 from hivemind import DHT
 from hivemind.utils.logging import get_logger
 from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.models.gemma2 import (
-    Gemma2ForCausalLM,
-    Gemma2ForSequenceClassification,
-    Gemma2Model,
-    Gemma2PreTrainedModel,
-)
+try:
+    from transformers.models.gemma4.modeling_gemma4 import (
+        Gemma4TextForCausalLM as _BaseCausalLM,
+        Gemma4TextForSequenceClassification as _BaseSeqCls,
+        Gemma4TextModel as _BaseModel,
+        Gemma4TextPreTrainedModel as _BasePreTrained,
+    )
+except ImportError:
+    from transformers.models.gemma2 import (
+        _BaseCausalLM as _BaseCausalLM,
+        _BaseSeqCls as _BaseSeqCls,
+        _BaseModel as _BaseModel,
+        _BasePreTrained as _BasePreTrained,
+    )
 
 from bloombee.client.from_pretrained import FromPretrainedMixin
 from bloombee.client.lm_head import LMHead
@@ -23,7 +31,7 @@ from bloombee.utils.auto_config import DefaultRevisionMixin
 logger = get_logger(__name__)
 
 
-class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixin, Gemma2Model):
+class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixin, _BaseModel):
     """Gemma4TextModel (backed by Gemma2 classes), but all transformer layers are hosted by the swarm"""
 
     _keys_to_ignore_on_load_missing = PTuneMixin._keys_to_ignore_on_load_missing
@@ -136,14 +144,14 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         return self.norm
 
 
-class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Gemma2ForCausalLM):
+class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, _BaseCausalLM):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
 
     config_class = DistributedGemma4Config
 
     def __init__(self, config: DistributedGemma4Config):
-        Gemma2PreTrainedModel.__init__(self, config)
+        _BasePreTrained.__init__(self, config)
         self.model = DistributedGemma4Model(config)
         self.lm_head = LMHead(config)
 
@@ -158,14 +166,14 @@ class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, G
         return self.model
 
 
-class DistributedGemma4ForSequenceClassification(FromPretrainedMixin, Gemma2ForSequenceClassification):
+class DistributedGemma4ForSequenceClassification(FromPretrainedMixin, _BaseSeqCls):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
 
     config_class = DistributedGemma4Config
 
     def __init__(self, config: DistributedGemma4Config):
-        Gemma2PreTrainedModel.__init__(self, config)
+        _BasePreTrained.__init__(self, config)
         self.num_labels = config.num_labels
 
         self.model = DistributedGemma4Model(config)

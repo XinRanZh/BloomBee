@@ -1,8 +1,12 @@
 import os
 from typing import Optional, Union
 
-from transformers.models.qwen2 import Qwen2Config
-from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
+try:
+    from transformers.models.qwen3 import Qwen3Config as _BaseConfig
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention as _BaseAttention
+except ImportError:
+    from transformers.models.qwen2 import Qwen2Config as _BaseConfig
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention as _BaseAttention
 
 from bloombee.client.config import ClientConfig
 from bloombee.client.lm_head import LMHeadConfig
@@ -13,11 +17,11 @@ from bloombee.utils.hivemind_compat import get_logger
 logger = get_logger(__name__)
 
 
-class DistributedQwen3Config(Qwen2Config, ClientConfig, PTuneConfig, LMHeadConfig):
+class DistributedQwen3Config(_BaseConfig, ClientConfig, PTuneConfig, LMHeadConfig):
     model_type = "qwen3"
 
     block_class = WrappedQwen3Block
-    attn_class = Qwen2Attention
+    attn_class = _BaseAttention
     block_prefix = "model.layers"
 
     num_key_value_groups = 1

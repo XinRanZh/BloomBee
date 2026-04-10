@@ -5,12 +5,20 @@ import torch.nn as nn
 from hivemind import DHT
 from hivemind.utils.logging import get_logger
 from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.models.qwen2 import (
-    Qwen2ForCausalLM,
-    Qwen2ForSequenceClassification,
-    Qwen2Model,
-    Qwen2PreTrainedModel,
-)
+try:
+    from transformers.models.qwen3 import (
+        Qwen3ForCausalLM as _BaseCausalLM,
+        Qwen3ForSequenceClassification as _BaseSeqCls,
+        Qwen3Model as _BaseModel,
+        Qwen3PreTrainedModel as _BasePreTrained,
+    )
+except ImportError:
+    from transformers.models.qwen2 import (
+        _BaseCausalLM as _BaseCausalLM,
+        _BaseSeqCls as _BaseSeqCls,
+        _BaseModel as _BaseModel,
+        _BasePreTrained as _BasePreTrained,
+    )
 
 from bloombee.client.from_pretrained import FromPretrainedMixin
 from bloombee.client.lm_head import LMHead
@@ -23,7 +31,7 @@ from bloombee.utils.auto_config import DefaultRevisionMixin
 logger = get_logger(__name__)
 
 
-class DistributedQwen3Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixin, Qwen2Model):
+class DistributedQwen3Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixin, _BaseModel):
     """Qwen3Model (backed by Qwen2 classes), but all transformer layers are hosted by the swarm"""
 
     _keys_to_ignore_on_load_missing = PTuneMixin._keys_to_ignore_on_load_missing
@@ -136,14 +144,14 @@ class DistributedQwen3Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixi
         return self.norm
 
 
-class DistributedQwen3ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Qwen2ForCausalLM):
+class DistributedQwen3ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, _BaseCausalLM):
     _keys_to_ignore_on_load_missing = DistributedQwen3Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedQwen3Model._keys_to_ignore_on_load_unexpected
 
     config_class = DistributedQwen3Config
 
     def __init__(self, config: DistributedQwen3Config):
-        Qwen2PreTrainedModel.__init__(self, config)
+        _BasePreTrained.__init__(self, config)
         self.model = DistributedQwen3Model(config)
         self.lm_head = LMHead(config)
 
@@ -158,14 +166,14 @@ class DistributedQwen3ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Qw
         return self.model
 
 
-class DistributedQwen3ForSequenceClassification(FromPretrainedMixin, Qwen2ForSequenceClassification):
+class DistributedQwen3ForSequenceClassification(FromPretrainedMixin, _BaseSeqCls):
     _keys_to_ignore_on_load_missing = DistributedQwen3Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedQwen3Model._keys_to_ignore_on_load_unexpected
 
     config_class = DistributedQwen3Config
 
     def __init__(self, config: DistributedQwen3Config):
-        Qwen2PreTrainedModel.__init__(self, config)
+        _BasePreTrained.__init__(self, config)
         self.num_labels = config.num_labels
 
         self.model = DistributedQwen3Model(config)

@@ -1,17 +1,22 @@
 from typing import Optional, Tuple
 
 import torch
-from transformers import Gemma2Config as Gemma4Config
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
-from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
+
+try:
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer as _BaseDecoderLayer
+    from transformers.models.gemma4 import Gemma4TextConfig as _BaseBlockConfig
+except ImportError:
+    from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer as _BaseDecoderLayer
+    from transformers import Gemma2Config as _BaseBlockConfig
 
 
-class WrappedGemma4Block(Gemma2DecoderLayer):
-    def __init__(self, config: Gemma4Config, layer_idx: int):
+class WrappedGemma4Block(_BaseDecoderLayer):
+    def __init__(self, config: _BaseBlockConfig, layer_idx: int):
         super().__init__(config, layer_idx)
 
         self._attn_implementation = config._attn_implementation

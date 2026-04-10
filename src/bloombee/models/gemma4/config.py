@@ -1,8 +1,12 @@
 import os
 from typing import Optional, Union
 
-from transformers.models.gemma2 import Gemma2Config
-from transformers.models.gemma2.modeling_gemma2 import Gemma2Attention
+try:
+    from transformers.models.gemma4 import Gemma4TextConfig as _BaseConfig
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4TextAttention as _BaseAttention
+except ImportError:
+    from transformers.models.gemma2 import Gemma2Config as _BaseConfig
+    from transformers.models.gemma2.modeling_gemma2 import Gemma2Attention as _BaseAttention
 
 from bloombee.client.config import ClientConfig
 from bloombee.client.lm_head import LMHeadConfig
@@ -13,11 +17,11 @@ from bloombee.utils.hivemind_compat import get_logger
 logger = get_logger(__name__)
 
 
-class DistributedGemma4Config(Gemma2Config, ClientConfig, PTuneConfig, LMHeadConfig):
+class DistributedGemma4Config(_BaseConfig, ClientConfig, PTuneConfig, LMHeadConfig):
     model_type = "gemma4"
 
     block_class = WrappedGemma4Block
-    attn_class = Gemma2Attention
+    attn_class = _BaseAttention
     block_prefix = "model.layers"
 
     num_key_value_groups = 1

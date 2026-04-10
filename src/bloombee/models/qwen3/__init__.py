@@ -9,10 +9,13 @@ from bloombee.models.qwen3.model import (
 )
 from bloombee.utils.auto_config import register_model_classes
 
-# Register "qwen3" model_type with HuggingFace's AutoConfig so that
-# AutoConfig.from_pretrained("Qwen/Qwen3-32B") works with transformers 4.43.1
-# (which only knows about "qwen2" natively).
-AutoConfig.register("qwen3", DistributedQwen3Config)
+# Register "qwen3" model_type with HuggingFace's AutoConfig.
+# Skip if already registered (transformers >= 5.x has native qwen3 support).
+try:
+    AutoConfig.register("qwen3", DistributedQwen3Config)
+except ValueError:
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+    CONFIG_MAPPING_NAMES["qwen3"] = "DistributedQwen3Config"
 
 register_model_classes(
     config=DistributedQwen3Config,

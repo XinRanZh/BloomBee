@@ -1,17 +1,22 @@
 from typing import Optional, Tuple
 
 import torch
-from transformers import Qwen2Config as Qwen3Config
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
-from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+
+try:
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer as _BaseDecoderLayer
+    from transformers.models.qwen3 import Qwen3Config as _BaseBlockConfig
+except ImportError:
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer as _BaseDecoderLayer
+    from transformers import Qwen2Config as _BaseBlockConfig
 
 
-class WrappedQwen3Block(Qwen2DecoderLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+class WrappedQwen3Block(_BaseDecoderLayer):
+    def __init__(self, config: _BaseBlockConfig, layer_idx: int):
         super().__init__(config, layer_idx)
 
         self._attn_implementation = config._attn_implementation

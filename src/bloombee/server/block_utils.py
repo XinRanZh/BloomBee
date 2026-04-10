@@ -4,6 +4,16 @@ import torch
 from accelerate import init_empty_weights
 from transformers import PretrainedConfig, PreTrainedModel
 
+
+def _autoset_attn(config):
+    """Set attention implementation on config, compatible with old and new transformers."""
+    if hasattr(PreTrainedModel, '_autoset_attn_implementation'):
+        return PreTrainedModel._autoset_attn_implementation(config)
+    # Newer transformers: just set a default if not already set
+    if not hasattr(config, '_attn_implementation') or config._attn_implementation is None:
+        config._attn_implementation = "eager"
+    return config
+
 from bloombee.models.gemma4.block import WrappedGemma4Block
 from bloombee.models.mixtral.block import WrappedMixtralBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
@@ -70,15 +80,15 @@ def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0):
     """
     if config.block_class == WrappedGemma4Block:
         dprint('server/block_utils.py config.block_class == WrappedGemma4Block ')
-        config = PreTrainedModel._autoset_attn_implementation(config)
+        config = _autoset_attn(config)
         return config.block_class(config, layer_idx)
     elif config.block_class == WrappedMixtralBlock:
         dprint('server/block_utils.py config.block_class == WrappedMixtralBlock ')
-        config = PreTrainedModel._autoset_attn_implementation(config)
+        config = _autoset_attn(config)
         return config.block_class(config, layer_idx)
     elif config.block_class == WrappedQwen3Block:
         dprint('server/block_utils.py config.block_class == WrappedQwen3Block ')
-        config = PreTrainedModel._autoset_attn_implementation(config)
+        config = _autoset_attn(config)
         return config.block_class(config, layer_idx)
     elif config.block_class == WrappedFalconBlock:
         dprint('server/block_utils.py config.block_class == WrappedFalconBlock ')

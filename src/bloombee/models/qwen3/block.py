@@ -136,15 +136,21 @@ class WrappedQwen3Block(_BaseDecoderLayer):
 
         # --- Extract updated cache and convert back to BloomBee format ---
         if use_cache and past_key_values is not None:
-            # In tf 5.x, DynamicCache.update() appends to the list.
-            # The KV for this layer is always the LAST entry after forward.
-            pk = past_key_values.key_cache[-1]   # [B, H, S_full, D]
-            pv = past_key_values.value_cache[-1]  # [B, H, S_full, D]
-            # Only keep NEW tokens (BloomBee manages cumulative cache externally)
-            pk = pk[:, :, past_key_values_length:, :]
-            pv = pv[:, :, past_key_values_length:, :]
-            present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
-            return (output_hidden, present_key_value)
+            # In tf 5.x, DynamicCache.update() appends to key_cache/value_cache.
+            # Find the actual KV entry (skip empty placeholders).
+            pk = pv = None
+            for i in range(len(past_key_values.key_cache) - 1, -1, -1):
+                t = past_key_values.key_cache[i]
+                if t.dim() == 4:  # Valid [B, H, S, D] tensor
+                    pk = t
+                    pv = past_key_values.value_cache[i]
+                    break
+            if pk is not None:
+                # Only keep NEW tokens (BloomBee manages cumulative cache externally)
+                pk = pk[:, :, past_key_values_length:, :]
+                pv = pv[:, :, past_key_values_length:, :]
+                present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
+                return (output_hidden, present_key_value)
 
         return (output_hidden,)
 

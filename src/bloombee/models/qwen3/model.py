@@ -107,14 +107,14 @@ class DistributedQwen3Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixi
         hidden_states = inputs_embeds
         output_shape = input_shape + (hidden_states.size(-1),)
 
-        if past_key_values is None:
+        if not isinstance(past_key_values, RemotePastKeyValues):
             past_key_values = RemotePastKeyValues()
         past_key_values.update_seen(hidden_states.size(1))
 
         hidden_states = self.layers(
             hidden_states,
             prompts=intermediate_prompts,
-            hypo_ids=past_key_values.hypo_ids if past_key_values is not None else None,
+            hypo_ids=past_key_values.hypo_ids,
         )
 
         # Remove prefix
@@ -151,6 +151,7 @@ class DistributedQwen3Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixi
 class DistributedQwen3ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, _BaseCausalLM):
     _keys_to_ignore_on_load_missing = DistributedQwen3Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedQwen3Model._keys_to_ignore_on_load_unexpected
+    _supports_cache_class = True
     config_class = DistributedQwen3Config
 
     def __init__(self, config: DistributedQwen3Config):

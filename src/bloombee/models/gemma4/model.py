@@ -98,14 +98,14 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         hidden_states = inputs_embeds
         output_shape = input_shape + (hidden_states.size(-1),)
 
-        if past_key_values is None:
+        if not isinstance(past_key_values, RemotePastKeyValues):
             past_key_values = RemotePastKeyValues()
         past_key_values.update_seen(hidden_states.size(1))
 
         hidden_states = self.layers(
             hidden_states,
             prompts=intermediate_prompts,
-            hypo_ids=past_key_values.hypo_ids if past_key_values is not None else None,
+            hypo_ids=past_key_values.hypo_ids,
         )
 
         if use_prompts:
@@ -140,6 +140,7 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
 class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Gemma4ForCausalLM):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
+    _supports_cache_class = True
     config_class = DistributedGemma4Config
 
     def __init__(self, config: DistributedGemma4Config):

@@ -12,21 +12,31 @@ from transformers.generation.utils import ModelOutput
 
 from bloombee.client.inference_session import InferenceSession
 from bloombee.client.remote_sequential import RemoteSequential
+from bloombee.utils.cache_compat import init_cache_base
 from bloombee.utils.misc import DUMMY, docstring_from
 
 logger = get_logger(__name__)
 
 
 class RemotePastKeyValues(Cache):
-    """only keeps the number of seen tokens. pretends to be a legit cache"""
+    """Only tracks seen-token counts plus BloomBee routing metadata.
+    Compatible with both transformers 4.x and 5.x Cache API."""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, seen_tokens: Optional[Union[int, torch.Tensor]] = None) -> None:
+        init_cache_base(self)
         self._seen_tokens: Optional[torch.Tensor] = None
         self.hypo_ids: Optional[torch.LongTensor] = None
         self.kv_cache_position_ids: Optional[torch.LongTensor] = None
         self.is_spec_decoding: Optional[torch.LongTensor] = None
         self.prefill_length: Optional[torch.LongTensor] = None
+        if seen_tokens is not None:
+            self.update_seen(seen_tokens)
+
+    def __len__(self) -> int:
+        return 1 if self._seen_tokens is not None else 0
+
+    def __bool__(self) -> bool:
+        return self.get_seq_length() > 0
 
     def __getitem__(self, _index: int) -> List[torch.Tensor]:
         return [DUMMY]  # For compatibility with BloomForCausalLM.prepare_inputs_for_generation()
@@ -37,11 +47,15 @@ class RemotePastKeyValues(Cache):
         if self._seen_tokens.dim() == 0:
             return self._seen_tokens.item()
         return self._seen_tokens[0].item()
-    
+
     def get_seq_length_batch(self) -> Optional[torch.Tensor]:
         return self._seen_tokens
 
     def get_max_length(self) -> Optional[int]:
+        return None
+
+    def get_max_cache_shape(self) -> Optional[int]:
+        """Required by transformers 5.x Cache interface."""
         return None
 
     def update_seen(self, new_seen: Union[int, torch.Tensor]) -> None:
@@ -54,16 +68,27 @@ class RemotePastKeyValues(Cache):
         else:
             raise TypeError(f"new_seen must be int or torch.Tensor, got {type(new_seen)}")
 
+    def crop(self, max_length: int) -> None:
+        """Required by transformers 5.x for assisted/speculative generation."""
+        if max_length < 0:
+            max_length = max(self.get_seq_length() + max_length, 0)
+        self.update_seen(max_length)
 
     def reorder_cache(self, beam_idx):
-        raise NotImplementedError("Beam search reordering is not implemented yet")
-    
+        if self._seen_tokens is not None and self._seen_tokens.dim() > 0 and self._seen_tokens.numel() > 1:
+            self._seen_tokens = self._seen_tokens.index_select(0, beam_idx.to(self._seen_tokens.device))
+        if self.hypo_ids is None:
+            self.hypo_ids = beam_idx
+        else:
+            self.hypo_ids = self.hypo_ids.index_select(0, beam_idx.to(self.hypo_ids.device))
+        return self
+
     def set_kv_cache(self, position_ids: Optional[torch.LongTensor]):
         self.kv_cache_position_ids = position_ids
-        
+
     def set_is_spec_decoding(self, is_spec_decoding: Optional[torch.LongTensor]):
         self.is_spec_decoding = is_spec_decoding
-        
+
     def set_prefill_length(self, prefill_length: Optional[torch.LongTensor]):
         self.prefill_length = prefill_length
 
@@ -156,10 +181,8 @@ class RemoteGenerationMixin(_SkipTokensMixin):
                 # but keep them for transformers.GenerationMixin (e.g., to compute repetition_penalty)
                 _skipped_tokens.set(max(0, n_prev_tokens - 1))
 
-            if getattr(self, "_supports_cache_class", False) and "past_key_values" not in kwargs:
-                past_key_values = RemotePastKeyValues()
-                past_key_values.update_seen(session.position)
-                kwargs["past_key_values"] = past_key_values
+            if "past_key_values" not in kwargs:
+                kwargs["past_key_values"] = RemotePastKeyValues(session.position)
 
             result = super().generate(inputs, *args, **kwargs)
 
@@ -188,4 +211,4 @@ class RemoteGenerationMixin(_SkipTokensMixin):
 
     @staticmethod
     def _reorder_cache(past_key_values: RemotePastKeyValues, beam_idx: torch.LongTensor) -> RemotePastKeyValues:
-        return dataclasses.replace(past_key_values, hypo_ids=beam_idx)
+        return past_key_values.reorder_cache(beam_idx)

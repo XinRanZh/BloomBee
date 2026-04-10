@@ -136,8 +136,10 @@ class WrappedQwen3Block(_BaseDecoderLayer):
 
         # --- Extract updated cache and convert back to BloomBee format ---
         if use_cache and past_key_values is not None:
-            pk = past_key_values.key_cache[self.layer_idx]   # [B, H, S_full, D]
-            pv = past_key_values.value_cache[self.layer_idx]  # [B, H, S_full, D]
+            # In tf 5.x, DynamicCache.update() appends to the list.
+            # The KV for this layer is always the LAST entry after forward.
+            pk = past_key_values.key_cache[-1]   # [B, H, S_full, D]
+            pv = past_key_values.value_cache[-1]  # [B, H, S_full, D]
             # Only keep NEW tokens (BloomBee manages cumulative cache externally)
             pk = pk[:, :, past_key_values_length:, :]
             pv = pv[:, :, past_key_values_length:, :]

@@ -151,8 +151,11 @@ class WrappedQwen3Block(_BaseDecoderLayer):
                 pv = pv[:, :, past_key_values_length:, :]
                 present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
                 return (output_hidden, present_key_value)
+            # No valid KV found — return empty cache
+            empty_k = torch.empty(0, device=hidden_states.device, dtype=hidden_states.dtype)
+            return (output_hidden, (empty_k, empty_k))
 
-        return (output_hidden,)
+        return (output_hidden, None)
 
     def _reorder_cache_from_bloom(
         self, key_value: Tuple[torch.Tensor, torch.Tensor], batch_size: int, seq_length: int

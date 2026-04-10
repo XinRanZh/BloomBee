@@ -120,7 +120,11 @@ def _load_hf_block_weights(
         max_disk_space=max_disk_space,
     )
     # state_dict keys already have block_prefix stripped, e.g. "self_attention.query_key_value.weight"
-    block.load_state_dict(state_dict, strict=False)
+    result = block.load_state_dict(state_dict, strict=False)
+    if result.missing_keys:
+        logger.warning(f"Missing keys in block {block_prefix}: {result.missing_keys}")
+    if result.unexpected_keys:
+        logger.warning(f"Unexpected keys in block {block_prefix}: {result.unexpected_keys}")
     return block.to(dtype=torch_dtype)
 
 

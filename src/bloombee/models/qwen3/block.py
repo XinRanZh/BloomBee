@@ -89,9 +89,21 @@ class WrappedQwen3Block(_BaseDecoderLayer):
             dtype=torch.long, device=hidden_states.device,
         )
 
-        # --- Build attention mask ---
-        # Let the native attention implementation handle causal masking
-        causal_mask = None
+        # --- Build causal attention mask ---
+        # Qwen3's attention does NOT auto-create causal masks. None means bidirectional.
+        # We must provide a proper causal mask for autoregressive generation.
+        total_length = past_key_values_length + seq_length
+        causal_mask = torch.full(
+            (seq_length, total_length), torch.finfo(hidden_states.dtype).min,
+            device=hidden_states.device, dtype=hidden_states.dtype,
+        )
+        causal_mask = causal_mask.masked_fill(
+            torch.triu(torch.ones(seq_length, total_length, device=hidden_states.device, dtype=torch.bool),
+                       diagonal=past_key_values_length + 1).logical_not(),
+            0,
+        )
+        # Expand to [batch, 1, seq, total] for multi-head attention
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
 
         # --- Compute position_embeddings (cos, sin) for RoPE ---
         if self._rotary_emb is not None:

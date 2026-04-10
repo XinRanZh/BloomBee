@@ -31,26 +31,25 @@ class DistributedGemma4Config(Gemma4TextConfig, ClientConfig, PTuneConfig, LMHea
             dht_prefix = str(model_name_or_path)
             dht_prefix = dht_prefix.replace(".", "-")
             logger.info(f"Using DHT prefix: {dht_prefix}")
-        from transformers import AutoConfig as _HFAutoConfig
-        # Load the raw HF config first to check if it's a multimodal wrapper
-        raw_config = _HFAutoConfig.from_pretrained(model_name_or_path, *args, **kwargs)
-        raw = raw_config[0] if isinstance(raw_config, tuple) else raw_config
+        result = super().from_pretrained(model_name_or_path, *args, dht_prefix=dht_prefix, **kwargs)
+        config = result[0] if isinstance(result, tuple) else result
 
-        # If the config has a nested text_config (multimodal model), extract it
-        text_cfg = getattr(raw, "text_config", None)
-        if text_cfg is not None and hasattr(text_cfg, "num_hidden_layers"):
-            logger.info(f"Extracting text_config from multimodal Gemma4 config "
-                        f"(text layers={text_cfg.num_hidden_layers})")
-            # Convert text_config to our DistributedGemma4Config
-            config = cls(**text_cfg.to_dict(), dht_prefix=dht_prefix)
-            config.model_type = "gemma4"  # Keep as gemma4 for BloomBee routing
-        else:
-            result = super().from_pretrained(model_name_or_path, *args, dht_prefix=dht_prefix, **kwargs)
-            config = result[0] if isinstance(result, tuple) else result
+        # google/gemma-4-31b-it has nested text_config inside multimodal config.
+        # Our Gemma4TextConfig base may load default values (30 layers) instead of
+        # the actual text model values (60 layers). Fix by loading the raw HF config
+        # and copying text_config fields.
+        try:
+            from transformers import AutoConfig as _HFAutoConfig
+            raw = _HFAutoConfig.from_pretrained(model_name_or_path)
+            text_cfg = getattr(raw, "text_config", None)
+            if text_cfg is not None and text_cfg.num_hidden_layers != config.num_hidden_layers:
+                logger.info(f"Copying text_config fields (layers {text_cfg.num_hidden_layers})")
+                for key, val in text_cfg.to_dict().items():
+                    if key not in ("model_type",):  # Don't override model_type
+                        setattr(config, key, val)
+        except Exception as e:
+            logger.warning(f"Could not extract text_config: {e}")
 
         if config.pad_token_id is None:
             config.pad_token_id = 0
-        # Must return same format as parent: config or (config, kwargs)
-        if isinstance(raw_config, tuple):
-            return (config, raw_config[1] if len(raw_config) > 1 else {})
-        return config
+        return result

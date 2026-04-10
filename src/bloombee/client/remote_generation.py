@@ -156,7 +156,7 @@ class RemoteGenerationMixin(_SkipTokensMixin):
                 # but keep them for transformers.GenerationMixin (e.g., to compute repetition_penalty)
                 _skipped_tokens.set(max(0, n_prev_tokens - 1))
 
-            if self._supports_cache_class and "past_key_values" not in kwargs:
+            if getattr(self, "_supports_cache_class", False) and "past_key_values" not in kwargs:
                 past_key_values = RemotePastKeyValues()
                 past_key_values.update_seen(session.position)
                 kwargs["past_key_values"] = past_key_values

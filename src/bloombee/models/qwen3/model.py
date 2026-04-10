@@ -151,6 +151,7 @@ class DistributedQwen3Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixi
 class DistributedQwen3ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, _BaseCausalLM):
     _keys_to_ignore_on_load_missing = DistributedQwen3Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedQwen3Model._keys_to_ignore_on_load_unexpected
+    _supports_cache_class = True
 
     config_class = DistributedQwen3Config
 

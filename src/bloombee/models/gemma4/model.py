@@ -37,7 +37,11 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         assert len(self.layers) == 0
         config.num_hidden_layers = n_layer
 
-        self.layers = RemoteSequential(config, dht=dht)
+        # Force CPU context: transformers from_pretrained wraps __init__ in torch.device('cuda'),
+        # which hijacks torch.empty() in hivemind's DHT/MPFuture to create CUDA tensors.
+        # share_memory_() only works on CPU tensors, so we must reset device context here.
+        with torch.device('cpu'):
+            self.layers = RemoteSequential(config, dht=dht)
 
         self.requires_grad_(False)
         self.init_prompts(config)

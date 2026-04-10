@@ -14,7 +14,10 @@ from peft.tuners import lora
 from peft.utils import CONFIG_NAME, SAFETENSORS_WEIGHTS_NAME
 from safetensors import safe_open
 from safetensors.torch import load_file
-from transformers.utils import get_file_from_repo
+try:
+    from transformers.utils import get_file_from_repo
+except ImportError:
+    from transformers.utils import cached_file as get_file_from_repo
 
 from bloombee.server.block_utils import get_model_block, resolve_block_dtype
 from bloombee.utils.convert_block import QuantType

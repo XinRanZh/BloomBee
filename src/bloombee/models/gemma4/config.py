@@ -50,4 +50,7 @@ class DistributedGemma4Config(Gemma4TextConfig, ClientConfig, PTuneConfig, LMHea
 
         if config.pad_token_id is None:
             config.pad_token_id = 0
+        # Must return same format as parent: config or (config, kwargs)
+        if isinstance(raw_config, tuple):
+            return (config, raw_config[1] if len(raw_config) > 1 else {})
         return config

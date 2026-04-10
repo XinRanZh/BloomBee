@@ -23,6 +23,12 @@ class WrappedQwen3Block(_BaseDecoderLayer):
         self.sliding_window = config.sliding_window
         self.layer_idx = layer_idx
 
+        # BloomBee's backend.py accesses self_attn.num_heads — add it for compatibility
+        if not hasattr(self.self_attn, "num_heads"):
+            self.self_attn.num_heads = config.num_attention_heads
+        if not hasattr(self.self_attn, "num_key_value_heads"):
+            self.self_attn.num_key_value_heads = config.num_key_value_heads
+
     def forward(
         self,
         hidden_states: torch.Tensor,

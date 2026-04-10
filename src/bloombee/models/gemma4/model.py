@@ -8,10 +8,9 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 
 try:
     from transformers.models.gemma4.modeling_gemma4 import (
-        Gemma4TextForCausalLM,
-        Gemma4TextForSequenceClassification,
+        Gemma4ForCausalLM,
+        Gemma4PreTrainedModel,
         Gemma4TextModel,
-        Gemma4TextPreTrainedModel,
     )
     _HAS_NATIVE_GEMMA4 = True
 except ImportError:
@@ -141,14 +140,14 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         return self.norm
 
 
-class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Gemma4TextForCausalLM):
+class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Gemma4ForCausalLM):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
 
     config_class = DistributedGemma4Config
 
     def __init__(self, config: DistributedGemma4Config):
-        Gemma4TextPreTrainedModel.__init__(self, config)
+        Gemma4PreTrainedModel.__init__(self, config)
         self.model = DistributedGemma4Model(config)
         self.lm_head = LMHead(config)
         self.post_init()
@@ -161,14 +160,14 @@ class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, G
         return self.model
 
 
-class DistributedGemma4ForSequenceClassification(FromPretrainedMixin, Gemma4TextForSequenceClassification):
+class DistributedGemma4ForSequenceClassification(FromPretrainedMixin, Gemma4PreTrainedModel):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
 
     config_class = DistributedGemma4Config
 
     def __init__(self, config: DistributedGemma4Config):
-        Gemma4TextPreTrainedModel.__init__(self, config)
+        Gemma4PreTrainedModel.__init__(self, config)
         self.num_labels = config.num_labels
         self.model = DistributedGemma4Model(config)
         self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)

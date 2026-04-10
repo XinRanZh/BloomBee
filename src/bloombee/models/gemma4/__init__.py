@@ -9,13 +9,10 @@ from bloombee.models.gemma4.model import (
 )
 from bloombee.utils.auto_config import register_model_classes
 
-# Register "gemma4_text" model_type with HuggingFace's AutoConfig so that
+# Register "gemma4" model_type with HuggingFace's AutoConfig so that
 # AutoConfig.from_pretrained("google/gemma-4-31b-it") works with transformers
 # that only know about "gemma2" natively.
-AutoConfig.register("gemma4_text", DistributedGemma4Config)
-
-# Note: "gemma4" (multimodal) has a different model_type than "gemma4_text".
-# If needed, create a separate config subclass with model_type="gemma4".
+AutoConfig.register("gemma4", DistributedGemma4Config)
 
 register_model_classes(
     config=DistributedGemma4Config,

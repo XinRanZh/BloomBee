@@ -14,7 +14,7 @@ logger = get_logger(__name__)
 
 
 class DistributedGemma4Config(Gemma2Config, ClientConfig, PTuneConfig, LMHeadConfig):
-    model_type = "gemma4_text"
+    model_type = "gemma4"
 
     block_class = WrappedGemma4Block
     attn_class = Gemma2Attention

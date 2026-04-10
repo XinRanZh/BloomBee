@@ -44,9 +44,14 @@ class DistributedGemma4Config(Gemma4TextConfig, ClientConfig, PTuneConfig, LMHea
             text_cfg = getattr(raw, "text_config", None)
             if text_cfg is not None and text_cfg.num_hidden_layers != config.num_hidden_layers:
                 logger.info(f"Copying text_config fields (layers {text_cfg.num_hidden_layers})")
+                # Only copy simple (non-dict, non-object) fields + layer_types
+                skip_keys = {"model_type", "generation_config", "architectures", "transformers_version"}
                 for key, val in text_cfg.to_dict().items():
-                    if key not in ("model_type",):  # Don't override model_type
-                        setattr(config, key, val)
+                    if key in skip_keys:
+                        continue
+                    if isinstance(val, dict):
+                        continue  # Skip nested configs
+                    setattr(config, key, val)
         except Exception as e:
             logger.warning(f"Could not extract text_config: {e}")
 

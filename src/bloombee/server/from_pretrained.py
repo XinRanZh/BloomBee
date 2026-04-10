@@ -9,7 +9,7 @@ If necessary, one can rewrite this to implement a different behavior, such as:
 import json
 import time
 from contextlib import suppress
-from typing import Dict, Optional, Sequence, Union
+from typing import Dict, Optional, Union
 
 import safetensors
 import torch
@@ -20,7 +20,10 @@ from hivemind.utils.logging import get_logger
 from huggingface_hub import get_hf_file_metadata, hf_hub_url
 from huggingface_hub.utils import EntryNotFoundError
 from transformers import PretrainedConfig, PreTrainedModel
-from transformers.utils import get_file_from_repo
+try:
+    from transformers.utils import get_file_from_repo
+except ImportError:
+    from transformers.utils import cached_file as get_file_from_repo
 
 from bloombee.constants import DTYPE_MAP
 from bloombee.models.mixtral import WrappedMixtralBlock
@@ -65,7 +68,6 @@ def load_pretrained_block(
     token: Optional[Union[str, bool]] = None,
     cache_dir: Optional[str] = None,
     max_disk_space: Optional[int] = None,
-    tensor_parallel_devices: Optional[Sequence[torch.device]] = None,
 ) -> nn.Module:
     if config is None:
         config = AutoDistributedConfig.from_pretrained(model_name, use_auth_token=token)
@@ -75,32 +77,10 @@ def load_pretrained_block(
     assert torch_dtype in DTYPE_MAP.values(), f"torch_dtype must be one of {list(DTYPE_MAP.values())}"
     torch_dtype = resolve_block_dtype(config, torch_dtype)
 
-    use_native_flexgen_llama_tp = (
-        getattr(config, "model_type", None) == "llama"
-        and tensor_parallel_devices is not None
-        and len(tensor_parallel_devices) > 1
-    )
-
     # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Falcon, Mixtral)
     _is_hf_model = config.block_class in (WrappedFalconBlock, WrappedMixtralBlock)
 
-    if use_native_flexgen_llama_tp:
-        with init_empty_weights():
-            logger.info(
-                "Preparing FlexGen-native LLaMA TP block template for layer %s across %s devices",
-                block_index,
-                len(tensor_parallel_devices),
-            )
-            block = config.block_class(
-                config,
-                block_index,
-                env,
-                policy,
-                weight_home,
-                path,
-                skip_init_weights=True,
-            )
-    elif _is_hf_model:
+    if _is_hf_model:
         # For HF-based models: create block normally (weights on CPU) then load state dict
         block = get_model_block(config, env, policy, weight_home, path, layer_idx=block_index)
         block = _load_hf_block_weights(

@@ -14,8 +14,7 @@ from bloombee.utils.auto_config import register_model_classes
 try:
     AutoConfig.register("qwen3", DistributedQwen3Config)
 except ValueError:
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
-    CONFIG_MAPPING_NAMES["qwen3"] = "DistributedQwen3Config"
+    pass  # Already known to transformers natively
 
 register_model_classes(
     config=DistributedQwen3Config,

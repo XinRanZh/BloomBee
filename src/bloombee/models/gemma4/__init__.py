@@ -14,9 +14,7 @@ from bloombee.utils.auto_config import register_model_classes
 try:
     AutoConfig.register("gemma4", DistributedGemma4Config)
 except ValueError:
-    # Already registered by transformers natively — override the mapping
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
-    CONFIG_MAPPING_NAMES["gemma4"] = "DistributedGemma4Config"
+    pass  # Already known to transformers natively
 
 register_model_classes(
     config=DistributedGemma4Config,

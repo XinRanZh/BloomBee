@@ -14,7 +14,10 @@ def _autoset_attn(config):
         config._attn_implementation = "eager"
     return config
 
-from bloombee.models.gemma4.block import WrappedGemma4Block
+try:
+    from bloombee.models.gemma4.block import WrappedGemma4Block
+except ImportError:
+    WrappedGemma4Block = None  # Gemma4 requires transformers >= 5.0
 from bloombee.models.mixtral.block import WrappedMixtralBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
 from bloombee.models.qwen3.block import WrappedQwen3Block
@@ -78,7 +81,7 @@ def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0):
     - Falcon:  takes (config) only, no layer_idx, no FlexGen args
     - Llama:   takes (config, layer_idx, env, policy, weight_home, path) — FlexGen-based
     """
-    if config.block_class == WrappedGemma4Block:
+    if WrappedGemma4Block is not None and config.block_class == WrappedGemma4Block:
         dprint('server/block_utils.py config.block_class == WrappedGemma4Block ')
         config = _autoset_attn(config)
         return config.block_class(config, layer_idx)

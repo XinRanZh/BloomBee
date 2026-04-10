@@ -29,7 +29,10 @@ from bloombee.constants import DTYPE_MAP
 from bloombee.models.mixtral import WrappedMixtralBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
 from bloombee.models.qwen3.block import WrappedQwen3Block
-from bloombee.models.gemma4.block import WrappedGemma4Block
+try:
+    from bloombee.models.gemma4.block import WrappedGemma4Block
+except ImportError:
+    WrappedGemma4Block = None
 from bloombee.server.block_utils import get_model_block, resolve_block_dtype
 from bloombee.utils.auto_config import AutoDistributedConfig
 from bloombee.utils.disk_cache import DEFAULT_CACHE_DIR, allow_cache_reads, allow_cache_writes, free_disk_space_for
@@ -80,7 +83,10 @@ def load_pretrained_block(
     torch_dtype = resolve_block_dtype(config, torch_dtype)
 
     # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Falcon, Mixtral)
-    _is_hf_model = config.block_class in (WrappedFalconBlock, WrappedMixtralBlock, WrappedQwen3Block, WrappedGemma4Block)
+    _hf_block_classes = [WrappedFalconBlock, WrappedMixtralBlock, WrappedQwen3Block]
+    if WrappedGemma4Block is not None:
+        _hf_block_classes.append(WrappedGemma4Block)
+    _is_hf_model = config.block_class in _hf_block_classes
 
     if _is_hf_model:
         # For HF-based models: create block normally (weights on CPU) then load state dict

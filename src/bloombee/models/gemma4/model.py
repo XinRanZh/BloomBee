@@ -133,15 +133,18 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         return self.norm
 
 
-class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, nn.Module):
+class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Gemma4ForCausalLM):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
 
     config_class = DistributedGemma4Config
 
     def __init__(self, config: DistributedGemma4Config):
+        # Skip Gemma4PreTrainedModel.__init__ (expects multimodal config)
+        # Go directly to nn.Module.__init__ and set up manually
         nn.Module.__init__(self)
         self.config = config
+        self.generation_config = None  # Prevent from_model_config crash
         self.model = DistributedGemma4Model(config)
         self.lm_head = LMHead(config)
 
@@ -153,7 +156,7 @@ class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, n
         return self.model
 
 
-class DistributedGemma4ForSequenceClassification(FromPretrainedMixin, nn.Module):
+class DistributedGemma4ForSequenceClassification(FromPretrainedMixin, Gemma4PreTrainedModel):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
 
@@ -162,6 +165,7 @@ class DistributedGemma4ForSequenceClassification(FromPretrainedMixin, nn.Module)
     def __init__(self, config: DistributedGemma4Config):
         nn.Module.__init__(self)
         self.config = config
+        self.generation_config = None
         self.num_labels = config.num_labels
         self.model = DistributedGemma4Model(config)
         self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)

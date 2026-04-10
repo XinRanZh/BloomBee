@@ -78,32 +78,37 @@ class WrappedQwen3Block(_BaseDecoderLayer):
             past_key_values.key_cache = [torch.empty(0, device=hidden_states.device, dtype=hidden_states.dtype) for _ in range(self.layer_idx)]
             past_key_values.value_cache = [torch.empty(0, device=hidden_states.device, dtype=hidden_states.dtype) for _ in range(self.layer_idx)]
 
-        # --- Compute position_ids and position_embeddings ---
-        position_ids = torch.arange(
-            past_key_values_length, past_key_values_length + seq_length,
-            dtype=torch.long, device=hidden_states.device,
-        ).unsqueeze(0).expand(batch_size, -1)
+        # --- Use position_ids from backend if provided, otherwise compute ---
+        position_ids = kwargs.pop("position_ids", None)
+        if position_ids is None:
+            position_ids = torch.arange(
+                past_key_values_length, past_key_values_length + seq_length,
+                dtype=torch.long, device=hidden_states.device,
+            ).unsqueeze(0).expand(batch_size, -1)
 
         cache_position = torch.arange(
             past_key_values_length, past_key_values_length + seq_length,
             dtype=torch.long, device=hidden_states.device,
         )
 
-        # --- Build causal attention mask ---
-        # Qwen3's attention does NOT auto-create causal masks. None means bidirectional.
-        # We must provide a proper causal mask for autoregressive generation.
-        total_length = past_key_values_length + seq_length
-        causal_mask = torch.full(
-            (seq_length, total_length), torch.finfo(hidden_states.dtype).min,
-            device=hidden_states.device, dtype=hidden_states.dtype,
-        )
-        causal_mask = causal_mask.masked_fill(
-            torch.triu(torch.ones(seq_length, total_length, device=hidden_states.device, dtype=torch.bool),
-                       diagonal=past_key_values_length + 1).logical_not(),
-            0,
-        )
-        # Expand to [batch, 1, seq, total] for multi-head attention
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+        # --- Use attention mask from backend if provided, otherwise build causal mask ---
+        # The BloomBee backend (backend.py) already creates a proper causal mask and passes
+        # it via the attention_mask parameter. Use it if available.
+        if attention_mask is not None:
+            causal_mask = attention_mask
+        else:
+            # Fallback: build our own causal mask
+            total_length = past_key_values_length + seq_length
+            causal_mask = torch.full(
+                (seq_length, total_length), torch.finfo(hidden_states.dtype).min,
+                device=hidden_states.device, dtype=hidden_states.dtype,
+            )
+            causal_mask = causal_mask.masked_fill(
+                torch.triu(torch.ones(seq_length, total_length, device=hidden_states.device, dtype=torch.bool),
+                           diagonal=past_key_values_length + 1).logical_not(),
+                0,
+            )
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
 
         # --- Compute position_embeddings (cos, sin) for RoPE ---
         if self._rotary_emb is not None:
@@ -123,8 +128,8 @@ class WrappedQwen3Block(_BaseDecoderLayer):
         if position_embeddings is not None:
             forward_kwargs["position_embeddings"] = position_embeddings
 
-        # Filter out any kwargs that would conflict
-        skip_keys = set(forward_kwargs.keys()) | {"past_key_value", "layer_past"}
+        # Filter out any kwargs that would conflict or are BloomBee-specific
+        skip_keys = set(forward_kwargs.keys()) | {"past_key_value", "layer_past", "rotary_position_ids"}
         extra_kwargs = {k: v for k, v in kwargs.items() if k not in skip_keys}
 
         output_hidden = super().forward(hidden_states, *args, **forward_kwargs, **extra_kwargs)

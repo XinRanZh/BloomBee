@@ -9,9 +9,11 @@ from transformers.modeling_attn_mask_utils import (
 
 try:
     from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer as _BaseDecoderLayer
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding as _RotaryEmbedding
     from transformers.models.qwen3 import Qwen3Config as _BaseBlockConfig
 except ImportError:
     from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer as _BaseDecoderLayer
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding as _RotaryEmbedding
     from transformers import Qwen2Config as _BaseBlockConfig
 
 
@@ -20,8 +22,9 @@ class WrappedQwen3Block(_BaseDecoderLayer):
         super().__init__(config, layer_idx)
 
         self._attn_implementation = config._attn_implementation
-        self.sliding_window = config.sliding_window
+        self.sliding_window = getattr(config, "sliding_window", None)
         self.layer_idx = layer_idx
+        self._rotary_emb = _RotaryEmbedding(config)
 
         # BloomBee's backend.py accesses self_attn.num_heads — add it for compatibility
         if not hasattr(self.self_attn, "num_heads"):
@@ -93,10 +96,18 @@ class WrappedQwen3Block(_BaseDecoderLayer):
                 sliding_window=self.sliding_window,
             )
 
-        position_ids = torch.arange(
-            past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=hidden_states.device
-        )
-        position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+        position_ids = kwargs.pop("position_ids", None)
+        if position_ids is None:
+            position_ids = torch.arange(
+                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=hidden_states.device
+            ).unsqueeze(0).expand(batch_size, -1)
+
+        position_embeddings = self._rotary_emb(hidden_states, position_ids)
+
+        # Filter kwargs that conflict with our explicit args
+        skip_keys = {'position_ids', 'attention_mask', 'use_cache', 'rotary_position_ids',
+                     'position_embeddings', 'past_key_value', 'cache_position'}
+        extra_kwargs = {k: v for k, v in kwargs.items() if k not in skip_keys}
 
         outputs = super().forward(
             hidden_states,
@@ -105,7 +116,8 @@ class WrappedQwen3Block(_BaseDecoderLayer):
             position_ids=position_ids,
             past_key_value=past_key_value,
             use_cache=use_cache,
-            **{k: v for k, v in kwargs.items() if k not in ('position_ids', 'attention_mask', 'use_cache')}
+            position_embeddings=position_embeddings,
+            **extra_kwargs
         )
 
         # Extract hidden_states from outputs (may be tensor or tuple)

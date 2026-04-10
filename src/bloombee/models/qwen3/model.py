@@ -14,10 +14,10 @@ try:
     )
 except ImportError:
     from transformers.models.qwen2 import (
-        _BaseCausalLM as _BaseCausalLM,
-        _BaseSeqCls as _BaseSeqCls,
-        _BaseModel as _BaseModel,
-        _BasePreTrained as _BasePreTrained,
+        Qwen2ForCausalLM as _BaseCausalLM,
+        Qwen2ForSequenceClassification as _BaseSeqCls,
+        Qwen2Model as _BaseModel,
+        Qwen2PreTrainedModel as _BasePreTrained,
     )
 
 from bloombee.client.from_pretrained import FromPretrainedMixin

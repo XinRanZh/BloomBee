@@ -14,10 +14,10 @@ try:
     )
 except ImportError:
     from transformers.models.gemma2 import (
-        _BaseCausalLM as _BaseCausalLM,
-        _BaseSeqCls as _BaseSeqCls,
-        _BaseModel as _BaseModel,
-        _BasePreTrained as _BasePreTrained,
+        Gemma2ForCausalLM as _BaseCausalLM,
+        Gemma2ForSequenceClassification as _BaseSeqCls,
+        Gemma2Model as _BaseModel,
+        Gemma2PreTrainedModel as _BasePreTrained,
     )
 
 from bloombee.client.from_pretrained import FromPretrainedMixin

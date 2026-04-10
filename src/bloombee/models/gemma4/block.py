@@ -2,23 +2,45 @@ from typing import Optional, Tuple
 
 import torch
 from transformers.cache_utils import DynamicCache
-from transformers.modeling_attn_mask_utils import (
-    _prepare_4d_causal_attention_mask,
-    _prepare_4d_causal_attention_mask_for_sdpa,
-)
 
-# Always use Gemma2 as base — native Gemma4 classes have incompatible APIs
-from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer as _BaseDecoderLayer
-from transformers import Gemma2Config as _BaseBlockConfig
+try:
+    from transformers.models.gemma4.modeling_gemma4 import (
+        Gemma4TextDecoderLayer,
+        Gemma4TextConfig,
+        Gemma4TextRotaryEmbedding,
+    )
+    _HAS_NATIVE_GEMMA4 = True
+except ImportError:
+    _HAS_NATIVE_GEMMA4 = False
+
+if not _HAS_NATIVE_GEMMA4:
+    raise ImportError(
+        "Gemma4 support requires transformers >= 5.0 with native Gemma4 classes. "
+        "Install with: pip install 'transformers>=5.0'"
+    )
 
 
-class WrappedGemma4Block(_BaseDecoderLayer):
-    def __init__(self, config: _BaseBlockConfig, layer_idx: int):
+class WrappedGemma4Block(Gemma4TextDecoderLayer):
+    """Wraps Gemma4TextDecoderLayer for BloomBee's distributed block-serving protocol.
+
+    BloomBee calls each block with:
+        forward(hidden_states, layer_past=(k,v), attention_mask=..., use_cache=True, position_ids=...)
+    and expects:
+        (hidden_states, present_key_value) where present_key_value is (k_new, v_new)
+
+    Gemma4TextDecoderLayer expects:
+        forward(hidden_states, position_embeddings=(cos,sin), attention_mask=..., past_key_values=Cache, ...)
+    and returns:
+        hidden_states (cache updated in-place)
+    """
+
+    def __init__(self, config: Gemma4TextConfig, layer_idx: int):
         super().__init__(config, layer_idx)
-
-        self._attn_implementation = config._attn_implementation
-        self.sliding_window = config.sliding_window
         self.layer_idx = layer_idx
+        # Create rotary embedding for this block (normally lives in the model)
+        self._rotary_emb = Gemma4TextRotaryEmbedding(config)
+        # Determine layer type for rotary
+        self._layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else "full_attention"
 
     def forward(
         self,
@@ -30,120 +52,94 @@ class WrappedGemma4Block(_BaseDecoderLayer):
         **kwargs
     ):
         batch_size, seq_length, _ = hidden_states.shape
-
-        seq_length_with_past = seq_length
         past_key_values_length = 0
 
-        past_key_value = layer_past
-
-        if past_key_value is not None:
-            # Fix dtype and device mismatch (analogous to Falcon fixes #7 and pipeline-parallel fix):
-            # Cache may be float16 while hidden_states is bfloat16, and may be on cuda:0
-            # while this block lives on a different GPU (pipeline parallelism).
-            pk, pv = past_key_value
+        # --- Convert BloomBee's layer_past to HF DynamicCache ---
+        past_key_values = None
+        if layer_past is not None:
+            pk, pv = layer_past
             if pk.dtype != hidden_states.dtype or pk.device != hidden_states.device:
                 pk = pk.to(device=hidden_states.device, dtype=hidden_states.dtype)
                 pv = pv.to(device=hidden_states.device, dtype=hidden_states.dtype)
-                past_key_value = (pk, pv)
-            past_key_values_length = past_key_value[0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
-            _past_key_value = self._reorder_cache_from_bloom(past_key_value, batch_size, past_key_values_length)
-            past_key_value = DynamicCache()
-            past_key_value.key_cache = [torch.empty(0) for _ in range(self.layer_idx)] + [_past_key_value[0]]
-            past_key_value.value_cache = [torch.empty(0) for _ in range(self.layer_idx)] + [_past_key_value[1]]
-            past_key_value._seen_tokens = past_key_values_length
+            past_key_values_length = pk.shape[2]
+            pk, pv = self._reorder_cache_from_bloom((pk, pv), batch_size, past_key_values_length)
+            past_key_values = DynamicCache()
+            past_key_values.key_cache = [torch.empty(0) for _ in range(self.layer_idx)] + [pk]
+            past_key_values.value_cache = [torch.empty(0) for _ in range(self.layer_idx)] + [pv]
+            past_key_values._seen_tokens = past_key_values_length
         elif use_cache:
-            # transformers 4.36+: must pass a DynamicCache (even empty) to get KV cache back.
-            # Passing past_key_value=None returns None as present_key_value.
-            # Also, DynamicCache.update() appends when len(key_cache) <= layer_idx, so we
-            # pre-populate with None placeholders for layers 0..layer_idx-1 to ensure
-            # key_cache[layer_idx] is accessible after the first update() call.
-            past_key_value = DynamicCache()
-            past_key_value.key_cache = [None] * self.layer_idx
-            past_key_value.value_cache = [None] * self.layer_idx
+            past_key_values = DynamicCache()
+            past_key_values.key_cache = [None] * self.layer_idx
+            past_key_values.value_cache = [None] * self.layer_idx
 
-        if self._attn_implementation == "flash_attention_2":
-            # 2d mask is passed through the layers
-            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        elif self._attn_implementation == "sdpa":
-            # output_attentions=True can not be supported when using SDPA, and we fall back on
-            # the manual implementation that requires a 4D causal mask in all cases.
-            # Pass None instead of the backend's 3D float mask: the backend mask has the right
-            # causal structure but wrong shape/type for this function (expects 2D binary or None).
-            # Passing None causes it to build a correct causal mask from past_key_values_length.
-            attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                None,
-                (batch_size, seq_length),
-                hidden_states,
-                past_key_values_length,
-            )
-        else:
-            # 4d mask is passed through the layers
-            # Pass None instead of the backend's 3D float mask (same reason as sdpa branch above).
-            attention_mask = _prepare_4d_causal_attention_mask(
-                None,
-                (batch_size, seq_length),
-                hidden_states,
-                past_key_values_length,
-                sliding_window=self.sliding_window,
-            )
-
+        # --- Compute position_ids and position_embeddings ---
         position_ids = torch.arange(
-            past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=hidden_states.device
-        )
-        position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+            past_key_values_length, seq_length + past_key_values_length,
+            dtype=torch.long, device=hidden_states.device
+        ).unsqueeze(0).expand(batch_size, -1)
 
-        outputs = super().forward(
+        position_embeddings = self._rotary_emb(hidden_states, position_ids, self._layer_type)
+
+        # --- Build attention mask ---
+        # Gemma4 native attention handles masking internally via the attention implementation.
+        # We pass a causal mask. For simplicity, pass None and let the attention build it.
+        # The native Gemma4 attention expects a 4D mask or None.
+        causal_mask = None  # Let the native attention handle causal masking
+
+        # --- Call native forward ---
+        # Gemma4TextDecoderLayer.forward returns just hidden_states (cache updated in-place)
+        output_hidden = super().forward(
             hidden_states,
-            *args,
-            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            attention_mask=causal_mask,
+            shared_kv_states={},  # No cross-layer KV sharing in distributed mode
+            past_key_values=past_key_values,
             position_ids=position_ids,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-            **{k: v for k, v in kwargs.items() if k not in ('position_ids', 'attention_mask', 'use_cache')}
         )
 
-        if use_cache:
-            present_key_value = outputs[-1]
-            pk, pv = present_key_value[self.layer_idx]  # [B, H, S_full, D]
-            # Only keep new tokens (analogous to Falcon fix #8):
-            # Gemma2Attention returns full K,V (past + new), but BloomBee's
-            # update_cache writes from prefix_length, so we only need new tokens.
+        # --- Extract updated cache and convert back to BloomBee format ---
+        if use_cache and past_key_values is not None:
+            pk = past_key_values.key_cache[self.layer_idx]   # [B, H, S_full, D]
+            pv = past_key_values.value_cache[self.layer_idx]  # [B, H, S_full, D]
+            # Only keep NEW tokens (BloomBee manages cumulative cache externally)
             pk = pk[:, :, past_key_values_length:, :]
             pv = pv[:, :, past_key_values_length:, :]
             present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
-            outputs = outputs[:-1] + (present_key_value,)
+            return (output_hidden, present_key_value)
 
-        return outputs
+        return (output_hidden,)
 
     def _reorder_cache_from_bloom(
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int
     ) -> Tuple[torch.Tensor]:
+        """Convert BloomBee cache format to HF [B, H, S, D] format."""
         key_states, value_states = key_value
         if key_states.dim() == 4:
-            # select_cache() returns [B, H, S, D] where H = num_attention_heads.
-            # The cache is allocated for num_attention_heads but only the first num_key_value_heads
-            # heads are valid (GQA). Slice to only valid KV heads.
-            nkv = self.self_attn.num_key_value_heads
+            # Already [B, H, S, D] — just slice to valid KV heads
+            nkv = self.self_attn.config.num_key_value_heads
+            if hasattr(self.self_attn, 'num_key_value_heads'):
+                nkv = self.self_attn.num_key_value_heads
+            elif hasattr(self.self_attn, 'num_key_value_groups'):
+                nkv = self.self_attn.config.num_attention_heads // self.self_attn.num_key_value_groups
             key_states = key_states[:, :nkv, :, :]
             value_states = value_states[:, :nkv, :, :]
             return (key_states, value_states)
         # 3D case: key is [B*H, D, S], value is [B*H, S, D]
+        head_dim = self.self_attn.head_dim
+        nkv = key_states.shape[0] // batch_size
         key_states = key_states.permute(0, 2, 1)  # [B*H, D, S] -> [B*H, S, D]
-        key_states = key_states.view(
-            batch_size, self.self_attn.num_key_value_heads, seq_length, self.self_attn.head_dim
-        )
-        value_states = value_states.view(*key_states.shape)
+        key_states = key_states.view(batch_size, nkv, seq_length, head_dim)
+        value_states = value_states.view(batch_size, nkv, seq_length, head_dim)
         return (key_states, value_states)
 
     def _reorder_cache_to_bloom(
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int
     ) -> Tuple[torch.Tensor]:
+        """Convert HF [B, H, S, D] cache back to BloomBee format."""
         key_states, value_states = key_value
-        # Use reshape (not view) since tensors from DynamicCache may be non-contiguous
-        value_states = value_states.reshape(
-            batch_size * self.self_attn.num_key_value_heads, seq_length, self.self_attn.head_dim
-        )
-        key_states = key_states.reshape(*value_states.shape)
-        key_states = key_states.permute(0, 2, 1)
+        head_dim = key_states.shape[-1]
+        nkv = key_states.shape[1]
+        value_states = value_states.reshape(batch_size * nkv, seq_length, head_dim)
+        key_states = key_states.reshape(batch_size * nkv, seq_length, head_dim)
+        key_states = key_states.permute(0, 2, 1)  # [B*H, S, D] -> [B*H, D, S]
         return (key_states, value_states)

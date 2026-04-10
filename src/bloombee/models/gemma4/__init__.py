@@ -1,24 +1,29 @@
-from transformers import AutoConfig
+import logging
 
-from bloombee.models.gemma4.block import WrappedGemma4Block
-from bloombee.models.gemma4.config import DistributedGemma4Config
-from bloombee.models.gemma4.model import (
-    DistributedGemma4ForCausalLM,
-    DistributedGemma4ForSequenceClassification,
-    DistributedGemma4Model,
-)
-from bloombee.utils.auto_config import register_model_classes
+logger = logging.getLogger(__name__)
 
-# Register "gemma4" model_type with HuggingFace's AutoConfig.
-# Skip if already registered (transformers >= 5.x has native gemma4 support).
 try:
-    AutoConfig.register("gemma4", DistributedGemma4Config)
-except ValueError:
-    pass  # Already known to transformers natively
+    from bloombee.models.gemma4.block import WrappedGemma4Block
+    from bloombee.models.gemma4.config import DistributedGemma4Config
+    from bloombee.models.gemma4.model import (
+        DistributedGemma4ForCausalLM,
+        DistributedGemma4ForSequenceClassification,
+        DistributedGemma4Model,
+    )
+    from bloombee.utils.auto_config import register_model_classes
+    from transformers import AutoConfig
 
-register_model_classes(
-    config=DistributedGemma4Config,
-    model=DistributedGemma4Model,
-    model_for_causal_lm=DistributedGemma4ForCausalLM,
-    model_for_sequence_classification=DistributedGemma4ForSequenceClassification,
-)
+    # Register "gemma4" model_type. Skip if already registered natively.
+    try:
+        AutoConfig.register("gemma4", DistributedGemma4Config)
+    except ValueError:
+        pass
+
+    register_model_classes(
+        config=DistributedGemma4Config,
+        model=DistributedGemma4Model,
+        model_for_causal_lm=DistributedGemma4ForCausalLM,
+        model_for_sequence_classification=DistributedGemma4ForSequenceClassification,
+    )
+except ImportError:
+    logger.info("Gemma4 support unavailable (requires transformers >= 5.0 with native Gemma4 classes)")

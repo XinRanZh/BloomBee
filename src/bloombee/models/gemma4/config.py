@@ -1,9 +1,12 @@
 import os
 from typing import Optional, Union
 
-# Always use Gemma2 as base — native Gemma4 classes have incompatible APIs
-from transformers.models.gemma2 import Gemma2Config as _BaseConfig
-from transformers.models.gemma2.modeling_gemma2 import Gemma2Attention as _BaseAttention
+try:
+    from transformers.models.gemma4 import Gemma4TextConfig
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4TextAttention
+    _HAS_NATIVE_GEMMA4 = True
+except ImportError:
+    _HAS_NATIVE_GEMMA4 = False
 
 from bloombee.client.config import ClientConfig
 from bloombee.client.lm_head import LMHeadConfig
@@ -13,12 +16,18 @@ from bloombee.utils.hivemind_compat import get_logger
 
 logger = get_logger(__name__)
 
+if not _HAS_NATIVE_GEMMA4:
+    raise ImportError(
+        "Gemma4 support requires transformers >= 5.0 with native Gemma4 classes. "
+        "Install with: pip install 'transformers>=5.0'"
+    )
 
-class DistributedGemma4Config(_BaseConfig, ClientConfig, PTuneConfig, LMHeadConfig):
+
+class DistributedGemma4Config(Gemma4TextConfig, ClientConfig, PTuneConfig, LMHeadConfig):
     model_type = "gemma4"
 
     block_class = WrappedGemma4Block
-    attn_class = _BaseAttention
+    attn_class = Gemma4TextAttention
     block_prefix = "model.layers"
 
     num_key_value_groups = 1

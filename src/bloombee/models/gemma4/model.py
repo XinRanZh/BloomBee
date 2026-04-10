@@ -5,13 +5,17 @@ import torch.nn as nn
 from hivemind import DHT
 from hivemind.utils.logging import get_logger
 from transformers.modeling_outputs import BaseModelOutputWithPast
-# Always use Gemma2 as base — native Gemma4 classes have incompatible APIs
-from transformers.models.gemma2 import (
-    Gemma2ForCausalLM as _BaseCausalLM,
-    Gemma2ForSequenceClassification as _BaseSeqCls,
-    Gemma2Model as _BaseModel,
-    Gemma2PreTrainedModel as _BasePreTrained,
-)
+
+try:
+    from transformers.models.gemma4.modeling_gemma4 import (
+        Gemma4TextForCausalLM,
+        Gemma4TextForSequenceClassification,
+        Gemma4TextModel,
+        Gemma4TextPreTrainedModel,
+    )
+    _HAS_NATIVE_GEMMA4 = True
+except ImportError:
+    _HAS_NATIVE_GEMMA4 = False
 
 from bloombee.client.from_pretrained import FromPretrainedMixin
 from bloombee.client.lm_head import LMHead
@@ -23,9 +27,12 @@ from bloombee.utils.auto_config import DefaultRevisionMixin
 
 logger = get_logger(__name__)
 
+if not _HAS_NATIVE_GEMMA4:
+    raise ImportError("Gemma4 support requires transformers >= 5.0")
 
-class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixin, _BaseModel):
-    """Gemma4TextModel (backed by Gemma2 classes), but all transformer layers are hosted by the swarm"""
+
+class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixin, Gemma4TextModel):
+    """Gemma4TextModel where all transformer layers are hosted by the swarm"""
 
     _keys_to_ignore_on_load_missing = PTuneMixin._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = [r"^model\.layers\."]
@@ -40,7 +47,7 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
 
         self.layers = RemoteSequential(config, dht=dht)
 
-        self.requires_grad_(False)  # Forbid accumulate grads for embeddings and layernorm
+        self.requires_grad_(False)
         self.init_prompts(config)
 
     def forward(
@@ -67,7 +74,6 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        # The causal mask will be added on the server-side
         assert (
             attention_mask is None or (attention_mask == 1).all()
         ), f"Custom attention masks are not supported, {attention_mask=}"
@@ -106,11 +112,9 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
             hypo_ids=past_key_values.hypo_ids if past_key_values is not None else None,
         )
 
-        # Remove prefix
         if use_prompts:
             hidden_states = hidden_states[:, self.pre_seq_len :]
 
-        # Add last hidden state
         hidden_states = self.norm(hidden_states)
         hidden_states = hidden_states.view(output_shape)
         return BaseModelOutputWithPast(
@@ -121,60 +125,55 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         )
 
     @property
-    def word_embeddings(self) -> nn.Embedding:  # For compatibility with RemoteGenerationMixin
+    def word_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
     @property
-    def word_embeddings_layernorm(self) -> nn.Module:  # For compatibility with RemoteGenerationMixin in tests
+    def word_embeddings_layernorm(self) -> nn.Module:
         return nn.Identity()
 
     @property
-    def h(self) -> RemoteSequential:  # For compatibility with RemoteGenerationMixin
+    def h(self) -> RemoteSequential:
         return self.layers
 
     @property
-    def ln_f(self) -> nn.Module:  # For compatibility with RemoteGenerationMixin in tests
+    def ln_f(self) -> nn.Module:
         return self.norm
 
 
-class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, _BaseCausalLM):
+class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Gemma4TextForCausalLM):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
 
     config_class = DistributedGemma4Config
 
     def __init__(self, config: DistributedGemma4Config):
-        _BasePreTrained.__init__(self, config)
+        Gemma4TextPreTrainedModel.__init__(self, config)
         self.model = DistributedGemma4Model(config)
         self.lm_head = LMHead(config)
-
-        # Initialize weights and apply final processing
         self.post_init()
 
     def get_output_embeddings(self):
         return self.lm_head
 
     @property
-    def transformer(self) -> DistributedGemma4Model:  # For compatibility with RemoteGenerationMixin
+    def transformer(self) -> DistributedGemma4Model:
         return self.model
 
 
-class DistributedGemma4ForSequenceClassification(FromPretrainedMixin, _BaseSeqCls):
+class DistributedGemma4ForSequenceClassification(FromPretrainedMixin, Gemma4TextForSequenceClassification):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
     _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
 
     config_class = DistributedGemma4Config
 
     def __init__(self, config: DistributedGemma4Config):
-        _BasePreTrained.__init__(self, config)
+        Gemma4TextPreTrainedModel.__init__(self, config)
         self.num_labels = config.num_labels
-
         self.model = DistributedGemma4Model(config)
         self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
-
-        # Initialize weights and apply final processing
         self.post_init()
 
     @property
-    def transformer(self) -> DistributedGemma4Model:  # For compatibility with RemoteGenerationMixin
+    def transformer(self) -> DistributedGemma4Model:
         return self.model

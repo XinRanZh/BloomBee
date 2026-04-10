@@ -31,8 +31,23 @@ class DistributedGemma4Config(Gemma4TextConfig, ClientConfig, PTuneConfig, LMHea
             dht_prefix = str(model_name_or_path)
             dht_prefix = dht_prefix.replace(".", "-")
             logger.info(f"Using DHT prefix: {dht_prefix}")
-        result = super().from_pretrained(model_name_or_path, *args, dht_prefix=dht_prefix, **kwargs)
-        config = result[0] if isinstance(result, tuple) else result
+        from transformers import AutoConfig as _HFAutoConfig
+        # Load the raw HF config first to check if it's a multimodal wrapper
+        raw_config = _HFAutoConfig.from_pretrained(model_name_or_path, *args, **kwargs)
+        raw = raw_config[0] if isinstance(raw_config, tuple) else raw_config
+
+        # If the config has a nested text_config (multimodal model), extract it
+        text_cfg = getattr(raw, "text_config", None)
+        if text_cfg is not None and hasattr(text_cfg, "num_hidden_layers"):
+            logger.info(f"Extracting text_config from multimodal Gemma4 config "
+                        f"(text layers={text_cfg.num_hidden_layers})")
+            # Convert text_config to our DistributedGemma4Config
+            config = cls(**text_cfg.to_dict(), dht_prefix=dht_prefix)
+            config.model_type = "gemma4"  # Keep as gemma4 for BloomBee routing
+        else:
+            result = super().from_pretrained(model_name_or_path, *args, dht_prefix=dht_prefix, **kwargs)
+            config = result[0] if isinstance(result, tuple) else result
+
         if config.pad_token_id is None:
             config.pad_token_id = 0
-        return result
+        return config

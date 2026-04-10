@@ -7,12 +7,9 @@ from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
 
-try:
-    from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer as _BaseDecoderLayer
-    from transformers.models.gemma4 import Gemma4TextConfig as _BaseBlockConfig
-except ImportError:
-    from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer as _BaseDecoderLayer
-    from transformers import Gemma2Config as _BaseBlockConfig
+# Always use Gemma2 as base — native Gemma4 classes have incompatible APIs
+from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer as _BaseDecoderLayer
+from transformers import Gemma2Config as _BaseBlockConfig
 
 
 class WrappedGemma4Block(_BaseDecoderLayer):

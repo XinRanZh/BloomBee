@@ -5,20 +5,13 @@ import torch.nn as nn
 from hivemind import DHT
 from hivemind.utils.logging import get_logger
 from transformers.modeling_outputs import BaseModelOutputWithPast
-try:
-    from transformers.models.gemma4.modeling_gemma4 import (
-        Gemma4TextForCausalLM as _BaseCausalLM,
-        Gemma4TextForSequenceClassification as _BaseSeqCls,
-        Gemma4TextModel as _BaseModel,
-        Gemma4TextPreTrainedModel as _BasePreTrained,
-    )
-except ImportError:
-    from transformers.models.gemma2 import (
-        Gemma2ForCausalLM as _BaseCausalLM,
-        Gemma2ForSequenceClassification as _BaseSeqCls,
-        Gemma2Model as _BaseModel,
-        Gemma2PreTrainedModel as _BasePreTrained,
-    )
+# Always use Gemma2 as base — native Gemma4 classes have incompatible APIs
+from transformers.models.gemma2 import (
+    Gemma2ForCausalLM as _BaseCausalLM,
+    Gemma2ForSequenceClassification as _BaseSeqCls,
+    Gemma2Model as _BaseModel,
+    Gemma2PreTrainedModel as _BasePreTrained,
+)
 
 from bloombee.client.from_pretrained import FromPretrainedMixin
 from bloombee.client.lm_head import LMHead

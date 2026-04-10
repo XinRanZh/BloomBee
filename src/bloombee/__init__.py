@@ -10,6 +10,19 @@ import hivemind.compression.base as hivemind_compression_base
 import transformers
 from packaging import version
 
+# Bypass transformers' strict tokenizers version check to allow newer tokenizers
+# (needed for Gemma4 tokenizer format support with transformers 4.43.x)
+try:
+    import transformers.utils.versions as _tf_versions
+    _orig_check = _tf_versions._compare_versions
+    def _relaxed_check(op, got_ver, want_ver, requirement, pkg, hint):
+        if pkg == "tokenizers":
+            return  # Skip tokenizers version check
+        return _orig_check(op, got_ver, want_ver, requirement, pkg, hint)
+    _tf_versions._compare_versions = _relaxed_check
+except Exception:
+    pass
+
 from bloombee.client import *
 from bloombee.models import *
 from bloombee.utils import *

@@ -1,12 +1,9 @@
 import os
 from typing import Optional, Union
 
-try:
-    from transformers.models.gemma4 import Gemma4TextConfig as _BaseConfig
-    from transformers.models.gemma4.modeling_gemma4 import Gemma4TextAttention as _BaseAttention
-except ImportError:
-    from transformers.models.gemma2 import Gemma2Config as _BaseConfig
-    from transformers.models.gemma2.modeling_gemma2 import Gemma2Attention as _BaseAttention
+# Always use Gemma2 as base — native Gemma4 classes have incompatible APIs
+from transformers.models.gemma2 import Gemma2Config as _BaseConfig
+from transformers.models.gemma2.modeling_gemma2 import Gemma2Attention as _BaseAttention
 
 from bloombee.client.config import ClientConfig
 from bloombee.client.lm_head import LMHeadConfig

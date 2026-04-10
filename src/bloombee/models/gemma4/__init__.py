@@ -14,8 +14,8 @@ from bloombee.utils.auto_config import register_model_classes
 # that only know about "gemma2" natively.
 AutoConfig.register("gemma4_text", DistributedGemma4Config)
 
-# Also register "gemma4" for the full multimodal model config (text part is the same)
-AutoConfig.register("gemma4", DistributedGemma4Config)
+# Note: "gemma4" (multimodal) has a different model_type than "gemma4_text".
+# If needed, create a separate config subclass with model_type="gemma4".
 
 register_model_classes(
     config=DistributedGemma4Config,

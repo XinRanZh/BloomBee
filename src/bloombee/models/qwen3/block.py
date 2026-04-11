@@ -103,6 +103,13 @@ class WrappedQwen3Block(_BaseDecoderLayer):
 
         position_embeddings = self._rotary_emb(hidden_states, position_ids)
 
+        # tf 5.x attention needs cache_position to know where to write new KV into the cache.
+        # Without it, DynamicCache is not updated and read-back returns only stale past KV.
+        cache_position = torch.arange(
+            past_key_values_length, past_key_values_length + seq_length,
+            dtype=torch.long, device=hidden_states.device,
+        )
+
         # Filter kwargs that conflict with our explicit args
         skip_keys = {'position_ids', 'attention_mask', 'use_cache', 'rotary_position_ids',
                      'position_embeddings', 'past_key_value', 'cache_position'}
@@ -116,6 +123,7 @@ class WrappedQwen3Block(_BaseDecoderLayer):
             past_key_value=past_key_value,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
+            cache_position=cache_position,
             **extra_kwargs
         )
 

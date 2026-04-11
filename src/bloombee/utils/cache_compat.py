@@ -9,13 +9,18 @@ import inspect
 from typing import Optional, Tuple
 
 import torch
-import transformers
-from packaging.version import parse as _parse_version
 from transformers.cache_utils import Cache, DynamicCache
 
-# ── Version detection ──────────────────────────────────────────────────────────
-_TF_VERSION = _parse_version(transformers.__version__)
-_IS_TF5 = _TF_VERSION >= _parse_version("5.0.0")
+# ── Feature detection (NOT version-based — tf 4.57+ backported the new API) ───
+# Probe a real DynamicCache instance to decide which API to use.
+_probe_cache = DynamicCache()
+_HAS_LAYERS_API = hasattr(_probe_cache, "layers")
+_HAS_KEY_CACHE = hasattr(_probe_cache, "key_cache")
+del _probe_cache
+
+# Public flag: True when DynamicCache uses the new .layers[] API
+# (covers tf 5.x AND tf 4.57+ which backported it)
+_IS_TF5 = _HAS_LAYERS_API
 
 # Legacy detection (kept for backward compat with other callers)
 _CACHE_INIT_PARAMS = inspect.signature(Cache.__init__).parameters

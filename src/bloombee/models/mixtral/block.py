@@ -9,7 +9,7 @@ from transformers.modeling_attn_mask_utils import (
 )
 from transformers.models.mixtral.modeling_mixtral import MixtralDecoderLayer
 
-from bloombee.utils.cache_compat import make_past_kv_cache, make_empty_kv_cache, read_kv_from_cache
+from bloombee.utils.cache_compat import make_past_kv_cache, make_empty_kv_cache, read_kv_from_cache, _IS_TF5
 
 
 class WrappedMixtralBlock(MixtralDecoderLayer):
@@ -86,25 +86,39 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
         )
         position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
 
+        # tf 5.x renamed past_key_value → past_key_values (plural)
+        skip_kw = {'position_ids', 'attention_mask', 'use_cache', 'past_key_value', 'past_key_values'}
+        extra_kwargs = {k: v for k, v in kwargs.items() if k not in skip_kw}
+        cache_kwarg_name = "past_key_values" if _IS_TF5 else "past_key_value"
+
         outputs = super().forward(
             hidden_states,
             *args,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
             use_cache=use_cache,
-            **{k: v for k, v in kwargs.items() if k not in ('position_ids', 'attention_mask', 'use_cache')}
+            **{cache_kwarg_name: past_key_value},
+            **extra_kwargs,
         )
 
         if use_cache:
-            cache_obj = outputs[-1]
+            # tf 5.x: outputs is just hidden_states tensor, cache updated in-place
+            # tf 4.x: outputs is (hidden_states, ..., cache) tuple
+            if isinstance(outputs, torch.Tensor):
+                output_hidden = outputs
+                cache_obj = past_key_value  # in-place updated
+            else:
+                output_hidden = outputs[0]
+                cache_obj = outputs[-1]
+
             pk, pv = read_kv_from_cache(cache_obj, self.layer_idx)
             if pk is not None:
-                # Only keep new tokens: BloomBee's update_cache writes from prefix_length
                 pk = pk[:, :, past_key_values_length:, :]
                 pv = pv[:, :, past_key_values_length:, :]
                 present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
-                outputs = outputs[:-1] + (present_key_value,)
+                return (output_hidden, present_key_value)
+
+            return (output_hidden, None) if isinstance(outputs, torch.Tensor) else outputs
 
         return outputs
 

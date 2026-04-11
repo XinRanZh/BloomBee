@@ -52,7 +52,7 @@ setup(
         "accelerate>=0.27.2",  
         "huggingface-hub>=0.11.1,<1.0.0",  
         "tokenizers>=0.13.3",  
-        "transformers>=4.43.1",  
+        "transformers>=5.5.3",  
         "speedtest-cli==2.1.3",  
         "hivemind @ git+https://github.com/learning-at-home/hivemind.git@4bd43b77895019b20d18d81d0d0c1a5ab9a10847",  
         "PyYAML",

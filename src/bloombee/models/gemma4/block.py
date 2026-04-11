@@ -101,7 +101,7 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
                 present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
                 return (output_hidden, present_key_value)
 
-        return (output_hidden,)
+        return (output_hidden, None)
 
     def _reorder_cache_from_bloom(
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int

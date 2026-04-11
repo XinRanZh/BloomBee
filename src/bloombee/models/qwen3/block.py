@@ -2,10 +2,6 @@ from typing import Optional, Tuple
 
 import torch
 from transformers.cache_utils import DynamicCache
-from transformers.modeling_attn_mask_utils import (
-    _prepare_4d_causal_attention_mask,
-    _prepare_4d_causal_attention_mask_for_sdpa,
-)
 
 from bloombee.utils.cache_compat import make_past_kv_cache, make_empty_kv_cache, read_kv_from_cache
 
@@ -69,31 +65,10 @@ class WrappedQwen3Block(_BaseDecoderLayer):
         elif use_cache:
             past_key_value = make_empty_kv_cache(self.layer_idx)
 
-        if self._attn_implementation == "flash_attention_2":
-            # 2d mask is passed through the layers
-            attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        elif self._attn_implementation == "sdpa":
-            # output_attentions=True can not be supported when using SDPA, and we fall back on
-            # the manual implementation that requires a 4D causal mask in all cases.
-            # Pass None instead of the backend's 3D float mask: the backend mask has the right
-            # causal structure but wrong shape/type for this function (expects 2D binary or None).
-            # Passing None causes it to build a correct causal mask from past_key_values_length.
-            attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                None,
-                (batch_size, seq_length),
-                hidden_states,
-                past_key_values_length,
-            )
-        else:
-            # 4d mask is passed through the layers
-            # Pass None instead of the backend's 3D float mask (same reason as sdpa branch above).
-            attention_mask = _prepare_4d_causal_attention_mask(
-                None,
-                (batch_size, seq_length),
-                hidden_states,
-                past_key_values_length,
-                sliding_window=self.sliding_window,
-            )
+        # tf 5.x attention implementations (SDPA, flash_attention_2, eager) handle
+        # causal masking internally when attention_mask=None. No need for the deprecated
+        # _prepare_4d_causal_attention_mask* helpers.
+        attention_mask = None
 
         position_ids = kwargs.pop("position_ids", None)
         if position_ids is None:
@@ -112,7 +87,7 @@ class WrappedQwen3Block(_BaseDecoderLayer):
 
         # Filter kwargs that conflict with our explicit args
         skip_keys = {'position_ids', 'attention_mask', 'use_cache', 'rotary_position_ids',
-                     'position_embeddings', 'past_key_value', 'cache_position'}
+                     'position_embeddings', 'past_key_value', 'past_key_values', 'cache_position'}
         extra_kwargs = {k: v for k, v in kwargs.items() if k not in skip_keys}
 
         outputs = super().forward(
@@ -120,7 +95,7 @@ class WrappedQwen3Block(_BaseDecoderLayer):
             *args,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_value=past_key_value,
+            past_key_values=past_key_value,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
             cache_position=cache_position,

@@ -7,6 +7,8 @@ from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
 
+from bloombee.utils.cache_compat import make_past_kv_cache, make_empty_kv_cache, read_kv_from_cache
+
 try:
     from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer as _BaseDecoderLayer
     from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding as _RotaryEmbedding
@@ -60,15 +62,12 @@ class WrappedQwen3Block(_BaseDecoderLayer):
             past_key_values_length = past_key_value[0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
             _past_key_value = self._reorder_cache_from_bloom(past_key_value, batch_size, past_key_values_length)
-            past_key_value = DynamicCache()
-            past_key_value.key_cache = [torch.empty(0) for _ in range(self.layer_idx)] + [_past_key_value[0]]
-            past_key_value.value_cache = [torch.empty(0) for _ in range(self.layer_idx)] + [_past_key_value[1]]
-            past_key_value._seen_tokens = past_key_values_length
+            past_key_value = make_past_kv_cache(
+                _past_key_value[0], _past_key_value[1],
+                layer_idx=self.layer_idx, seen_tokens=past_key_values_length,
+            )
         elif use_cache:
-            # transformers 4.36+: must pass a DynamicCache to get KV cache back.
-            # DynamicCache.update() appends when len(key_cache) <= layer_idx.
-            # We do NOT pre-fill: let update() handle the indexing naturally.
-            past_key_value = DynamicCache()
+            past_key_value = make_empty_kv_cache(self.layer_idx)
 
         if self._attn_implementation == "flash_attention_2":
             # 2d mask is passed through the layers
@@ -128,17 +127,10 @@ class WrappedQwen3Block(_BaseDecoderLayer):
         else:
             output_hidden = outputs
 
-        if use_cache and past_key_value is not None and hasattr(past_key_value, 'key_cache'):
-            # Read cache from DynamicCache (in-place updated by attention).
-            # After update(), the new KV is at the LAST index (appended).
-            pk = pv = None
-            for i in range(len(past_key_value.key_cache) - 1, -1, -1):
-                t = past_key_value.key_cache[i]
-                if t is not None and t.dim() == 4:
-                    pk = t
-                    pv = past_key_value.value_cache[i]
-                    break
+        if use_cache and past_key_value is not None:
+            pk, pv = read_kv_from_cache(past_key_value, self.layer_idx)
             if pk is not None:
+                # Extract only NEW tokens (BloomBee manages cumulative cache externally)
                 pk = pk[:, :, past_key_values_length:, :]
                 pv = pv[:, :, past_key_values_length:, :]
                 present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)

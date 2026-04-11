@@ -3,6 +3,8 @@ from typing import Optional, Tuple
 import torch
 from transformers.cache_utils import DynamicCache
 
+from bloombee.utils.cache_compat import make_past_kv_cache, make_empty_kv_cache, read_kv_from_cache
+
 from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4TextDecoderLayer,
     Gemma4TextConfig,
@@ -58,14 +60,11 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
                 pv = pv.to(device=hidden_states.device, dtype=hidden_states.dtype)
             past_key_values_length = pk.shape[2]
             pk, pv = self._reorder_cache_from_bloom((pk, pv), batch_size, past_key_values_length)
-            past_key_values = DynamicCache()
-            past_key_values.key_cache = [torch.empty(0) for _ in range(self.layer_idx)] + [pk]
-            past_key_values.value_cache = [torch.empty(0) for _ in range(self.layer_idx)] + [pv]
-            past_key_values._seen_tokens = past_key_values_length
+            past_key_values = make_past_kv_cache(
+                pk, pv, layer_idx=self.layer_idx, seen_tokens=past_key_values_length,
+            )
         elif use_cache:
-            past_key_values = DynamicCache()
-            past_key_values.key_cache = [None] * self.layer_idx
-            past_key_values.value_cache = [None] * self.layer_idx
+            past_key_values = make_empty_kv_cache(self.layer_idx)
 
         # --- Compute position_ids and position_embeddings ---
         position_ids = torch.arange(
@@ -94,13 +93,13 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
 
         # --- Extract updated cache and convert back to BloomBee format ---
         if use_cache and past_key_values is not None:
-            pk = past_key_values.key_cache[self.layer_idx]   # [B, H, S_full, D]
-            pv = past_key_values.value_cache[self.layer_idx]  # [B, H, S_full, D]
-            # Only keep NEW tokens (BloomBee manages cumulative cache externally)
-            pk = pk[:, :, past_key_values_length:, :]
-            pv = pv[:, :, past_key_values_length:, :]
-            present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
-            return (output_hidden, present_key_value)
+            pk, pv = read_kv_from_cache(past_key_values, self.layer_idx)
+            if pk is not None:
+                # Only keep NEW tokens (BloomBee manages cumulative cache externally)
+                pk = pk[:, :, past_key_values_length:, :]
+                pv = pv[:, :, past_key_values_length:, :]
+                present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
+                return (output_hidden, present_key_value)
 
         return (output_hidden,)
 

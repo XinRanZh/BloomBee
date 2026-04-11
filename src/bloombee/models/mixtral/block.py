@@ -9,6 +9,8 @@ from transformers.modeling_attn_mask_utils import (
 )
 from transformers.models.mixtral.modeling_mixtral import MixtralDecoderLayer
 
+from bloombee.utils.cache_compat import make_past_kv_cache, make_empty_kv_cache, read_kv_from_cache
+
 
 class WrappedMixtralBlock(MixtralDecoderLayer):
     def __init__(self, config: MixtralConfig, layer_idx: int):
@@ -46,19 +48,12 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
             past_key_values_length = past_key_value[0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
             _past_key_value = self._reorder_cache_from_bloom(past_key_value, batch_size, past_key_values_length)
-            past_key_value = DynamicCache()
-            past_key_value.key_cache = [torch.empty(0) for _ in range(self.layer_idx)] + [_past_key_value[0]]
-            past_key_value.value_cache = [torch.empty(0) for _ in range(self.layer_idx)] + [_past_key_value[1]]
-            past_key_value._seen_tokens = past_key_values_length
+            past_key_value = make_past_kv_cache(
+                _past_key_value[0], _past_key_value[1],
+                layer_idx=self.layer_idx, seen_tokens=past_key_values_length,
+            )
         elif use_cache:
-            # transformers 4.36+: must pass a DynamicCache (even empty) to get KV cache back.
-            # Passing past_key_value=None returns None as present_key_value.
-            # Also, DynamicCache.update() appends when len(key_cache) <= layer_idx, so we
-            # pre-populate with None placeholders for layers 0..layer_idx-1 to ensure
-            # key_cache[layer_idx] is accessible after the first update() call.
-            past_key_value = DynamicCache()
-            past_key_value.key_cache = [None] * self.layer_idx
-            past_key_value.value_cache = [None] * self.layer_idx
+            past_key_value = make_empty_kv_cache(self.layer_idx)
 
         if self._attn_implementation == "flash_attention_2":
             # 2d mask is passed through the layers
@@ -102,15 +97,14 @@ class WrappedMixtralBlock(MixtralDecoderLayer):
         )
 
         if use_cache:
-            present_key_value = outputs[-1]
-            pk, pv = present_key_value[self.layer_idx]  # [B, H, S_full, D]
-            # Only keep new tokens (analogous to Falcon fix #8):
-            # MixtralAttention returns full K,V (past + new), but BloomBee's
-            # update_cache writes from prefix_length, so we only need new tokens.
-            pk = pk[:, :, past_key_values_length:, :]
-            pv = pv[:, :, past_key_values_length:, :]
-            present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
-            outputs = outputs[:-1] + (present_key_value,)
+            cache_obj = outputs[-1]
+            pk, pv = read_kv_from_cache(cache_obj, self.layer_idx)
+            if pk is not None:
+                # Only keep new tokens: BloomBee's update_cache writes from prefix_length
+                pk = pk[:, :, past_key_values_length:, :]
+                pv = pv[:, :, past_key_values_length:, :]
+                present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
+                outputs = outputs[:-1] + (present_key_value,)
 
         return outputs
 

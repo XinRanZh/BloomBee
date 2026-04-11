@@ -136,20 +136,7 @@ class WrappedQwen3Block(_BaseDecoderLayer):
             output_hidden = outputs
 
         if use_cache and past_key_value is not None:
-            # DEBUG: inspect cache state after forward
-            import logging as _log
-            _dbg = _log.getLogger("bloombee.qwen3.cache_debug")
-            if hasattr(past_key_value, 'layers'):
-                _dbg.warning("tf5 cache: %d layers, layer_idx=%d", len(past_key_value.layers), self.layer_idx)
-                for _i, _l in enumerate(past_key_value.layers):
-                    _init = getattr(_l, 'is_initialized', 'N/A')
-                    _kshape = _l.keys.shape if hasattr(_l, 'keys') and _l.keys is not None else 'None'
-                    _dbg.warning("  layer[%d]: init=%s keys=%s", _i, _init, _kshape)
-            elif hasattr(past_key_value, 'key_cache'):
-                _dbg.warning("tf4 cache: %d entries, layer_idx=%d", len(past_key_value.key_cache), self.layer_idx)
             pk, pv = read_kv_from_cache(past_key_value, self.layer_idx)
-            _dbg.warning("read_kv result: pk=%s past_kvlen=%d seq_len=%d",
-                         pk.shape if pk is not None else None, past_key_values_length, seq_length)
             if pk is not None:
                 # Extract only NEW tokens (BloomBee manages cumulative cache externally)
                 pk = pk[:, :, past_key_values_length:, :]

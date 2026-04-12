@@ -47,10 +47,10 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
         # Derive actual per-layer KV dimensions from weights (not config).
         attn = self.self_attn
         kv_groups = getattr(attn, "num_key_value_groups", 1)
-        actual_kv_heads = config.num_attention_heads // kv_groups
-        kv_head_dim = attn.k_proj.weight.shape[0] // actual_kv_heads
-        attn.num_key_value_heads = actual_kv_heads
-        self._kv_head_dim = kv_head_dim
+        self._num_kv_heads = config.num_attention_heads // kv_groups
+        self._kv_head_dim = attn.k_proj.weight.shape[0] // self._num_kv_heads
+        # BloomBee's backend.py reads attn.num_heads for cache allocation.
+        # Only set if missing — do NOT override native attributes.
         if not hasattr(attn, "num_heads"):
             attn.num_heads = config.num_attention_heads
 
@@ -146,7 +146,7 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
         """Convert BloomBee cache [B*H, D, S] / [B*H, S, D] to HF [B, H, S, D]."""
         key_states, value_states = key_value
         if key_states.dim() == 4:
-            nkv = self.self_attn.num_key_value_heads
+            nkv = self._num_kv_heads
             key_states = key_states[:, :nkv, :, :]
             value_states = value_states[:, :nkv, :, :]
             return (key_states, value_states)

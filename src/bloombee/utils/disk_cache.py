@@ -10,7 +10,10 @@ from hivemind.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-DEFAULT_CACHE_DIR = os.getenv("BLOOMBEE_CACHE", Path(Path.home(), ".cache", "bloombee"))
+DEFAULT_CACHE_DIR = os.getenv(
+    "BLOOMBEE_CACHE",
+    os.getenv("HF_HOME", os.path.join(huggingface_hub.constants.HF_HUB_CACHE)),
+)
 
 BLOCKS_LOCK_FILE = "blocks.lock"
 

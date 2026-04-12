@@ -33,11 +33,12 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
         self._rotary_emb = Gemma4TextRotaryEmbedding(config)
         # Determine layer type for rotary
         self._layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else "full_attention"
-        # BloomBee's backend.py accesses self_attn.num_heads — add it for compatibility
-        if not hasattr(self.self_attn, "num_heads"):
-            self.self_attn.num_heads = config.num_attention_heads
-        if not hasattr(self.self_attn, "num_key_value_heads"):
-            self.self_attn.num_key_value_heads = config.num_key_value_heads
+        # Gemma4 sliding_attention and full_attention layers have different KV head
+        # counts. Derive the actual value from k_proj shape rather than config.
+        actual_kv_heads = self.self_attn.k_proj.weight.shape[0] // config.head_dim
+        self.self_attn.num_key_value_heads = actual_kv_heads
+        self.self_attn.num_heads = config.num_attention_heads
+        self.self_attn.head_dim = config.head_dim
 
     def forward(
         self,

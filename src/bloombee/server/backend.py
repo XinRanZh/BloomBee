@@ -122,15 +122,19 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self.dtype = backend_dtype
         self.dtype_bytes = get_size_in_bytes(self.dtype)
         self.shard_num_heads = []
-        # Detect per-block head_dim from actual attention weights.
-        # Critical for Gemma4: sliding layers use head_dim=256, full layers use 512.
+        # Detect per-block KV head_dim from actual attention weights.
+        # Gemma4 uses different head_dim for Q (256) vs KV (512) in full_attention layers.
+        # We need the KV head_dim for cache allocation, derived via num_key_value_groups.
         _block_head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         for shard in self.module.module_shards:
             for submodule in shard.modules():
                 if isinstance(submodule, config.attn_class):
                     self.shard_num_heads.append(submodule.num_heads)
-                    if hasattr(submodule, "q_proj"):
-                        _block_head_dim = submodule.q_proj.weight.shape[0] // config.num_attention_heads
+                    # Derive KV head_dim: k_proj.out / (num_attn_heads / num_kv_groups)
+                    kv_groups = getattr(submodule, "num_key_value_groups", 1)
+                    if hasattr(submodule, "k_proj") and kv_groups > 0:
+                        num_kv_heads = config.num_attention_heads // kv_groups
+                        _block_head_dim = submodule.k_proj.weight.shape[0] // num_kv_heads
         self.block_head_dim = _block_head_dim
         assert len(self.shard_num_heads) == len(self.module.devices)
         assert sum(self.shard_num_heads) == config.num_attention_heads

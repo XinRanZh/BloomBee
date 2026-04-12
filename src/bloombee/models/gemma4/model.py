@@ -1,9 +1,13 @@
-from typing import Optional
+import json
+import os
+from typing import Optional, Union
 
+import safetensors
 import torch
 import torch.nn as nn
 from hivemind import DHT
 from hivemind.utils.logging import get_logger
+from transformers import GenerationConfig
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from transformers.models.gemma4.modeling_gemma4 import (
@@ -21,6 +25,14 @@ from bloombee.models.gemma4.config import DistributedGemma4Config
 from bloombee.utils.auto_config import DefaultRevisionMixin
 
 logger = get_logger(__name__)
+
+# google/gemma-4-31b-it is a multimodal model. Safetensors store text weights
+# under "model.language_model.*" but our Gemma4TextModel expects "model.*".
+# This mapping is used by from_pretrained to load the correct weights.
+_GEMMA4_TEXT_WEIGHT_KEYS = {
+    "model.language_model.embed_tokens.weight": "model.embed_tokens.weight",
+    "model.language_model.norm.weight": "model.norm.weight",
+}
 
 
 class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMixin, Gemma4TextModel):
@@ -137,20 +149,97 @@ class DistributedGemma4Model(DefaultRevisionMixin, FromPretrainedMixin, PTuneMix
         return self.norm
 
 
-class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, Gemma4ForCausalLM):
+def _load_gemma4_text_weights(
+    model: "DistributedGemma4ForCausalLM",
+    model_name_or_path: Union[str, os.PathLike],
+    config: DistributedGemma4Config,
+) -> None:
+    """Load embed_tokens and norm weights from safetensors, handling multimodal key prefix.
+
+    google/gemma-4-31b-it stores text weights as model.language_model.X but our
+    Gemma4TextModel expects model.X. This function loads only the needed weights
+    (embed_tokens, norm) and ties lm_head to embed_tokens.
+    """
+    from huggingface_hub import hf_hub_download
+
+    # Resolve index file
+    try:
+        index_path = hf_hub_download(model_name_or_path, "model.safetensors.index.json")
+    except Exception:
+        # Local directory
+        index_path = os.path.join(model_name_or_path, "model.safetensors.index.json")
+
+    with open(index_path) as f:
+        index = json.load(f)
+
+    # Find which shards contain our needed weights
+    shards_needed = set()
+    for src_key in _GEMMA4_TEXT_WEIGHT_KEYS:
+        if src_key in index["weight_map"]:
+            shards_needed.add(index["weight_map"][src_key])
+
+    # Load weights from each shard
+    state_dict = {}
+    for shard_name in shards_needed:
+        try:
+            shard_path = hf_hub_download(model_name_or_path, shard_name)
+        except Exception:
+            shard_path = os.path.join(model_name_or_path, shard_name)
+
+        with safetensors.safe_open(shard_path, framework="pt", device="cpu") as f:
+            for src_key, dst_key in _GEMMA4_TEXT_WEIGHT_KEYS.items():
+                if src_key in [k for k in f.keys()]:
+                    state_dict[dst_key] = f.get_tensor(src_key)
+
+    # Load into the model
+    result = model.load_state_dict(state_dict, strict=False)
+    loaded = [k for k in state_dict if k not in result.unexpected_keys]
+    logger.info(f"Loaded Gemma4 text weights: {loaded}")
+
+    # Tie lm_head to embed_tokens (Gemma uses weight tying)
+    if config.tie_word_embeddings:
+        model.lm_head.weight = model.model.embed_tokens.weight
+        logger.info("Tied lm_head.weight to embed_tokens.weight")
+
+
+class DistributedGemma4ForCausalLM(RemoteGenerationMixin, Gemma4ForCausalLM):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
-    _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
+    _keys_to_ignore_on_load_unexpected = [
+        r"^model\.language_model\.layers\.",  # Layer weights are remote
+        r"^model\.vision_tower\.",            # Vision model not used
+        r"^model\.embed_vision\.",            # Vision embedding not used
+    ]
     _supports_cache_class = True
     config_class = DistributedGemma4Config
 
     def __init__(self, config: DistributedGemma4Config):
         # Skip Gemma4PreTrainedModel.__init__ (expects multimodal config)
-        # Go directly to nn.Module.__init__ and set up manually
         nn.Module.__init__(self)
         self.config = config
-        self.generation_config = None  # Prevent from_model_config crash
+        self.generation_config = GenerationConfig()
         self.model = DistributedGemma4Model(config)
         self.lm_head = LMHead(config)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_name_or_path: Union[str, os.PathLike, None],
+        *args,
+        **kwargs,
+    ):
+        """Load distributed Gemma4 model with proper multimodal→text key remapping."""
+        config = kwargs.pop("config", None)
+        if config is None:
+            config = DistributedGemma4Config.from_pretrained(model_name_or_path, *args, **kwargs)
+            if isinstance(config, tuple):
+                config = config[0]
+
+        with torch.device('cpu'):
+            model = cls(config)
+
+        _load_gemma4_text_weights(model, model_name_or_path, config)
+        model.eval()
+        return model
 
     def get_output_embeddings(self):
         return self.lm_head
@@ -160,9 +249,9 @@ class DistributedGemma4ForCausalLM(FromPretrainedMixin, RemoteGenerationMixin, G
         return self.model
 
 
-class DistributedGemma4ForSequenceClassification(FromPretrainedMixin, Gemma4PreTrainedModel):
+class DistributedGemma4ForSequenceClassification(Gemma4PreTrainedModel):
     _keys_to_ignore_on_load_missing = DistributedGemma4Model._keys_to_ignore_on_load_missing
-    _keys_to_ignore_on_load_unexpected = DistributedGemma4Model._keys_to_ignore_on_load_unexpected
+    _keys_to_ignore_on_load_unexpected = DistributedGemma4ForCausalLM._keys_to_ignore_on_load_unexpected
 
     config_class = DistributedGemma4Config
 

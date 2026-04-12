@@ -199,14 +199,17 @@ def _find_index_file(
 ) -> str:
     # If we have cached weights (e.g., Pickle from older Petals versions), reuse them
     for filename in INDEX_FILES:
-        path = get_file_from_repo(
-            model_name,
-            filename,
-            revision=revision,
-            use_auth_token=token,
-            cache_dir=cache_dir,
-            local_files_only=True,
-        )
+        try:
+            path = get_file_from_repo(
+                model_name,
+                filename,
+                revision=revision,
+                use_auth_token=token,
+                cache_dir=cache_dir,
+                local_files_only=True,
+            )
+        except (OSError, Exception):
+            path = None  # tf 5.x cached_file raises instead of returning None
         if path is not None:
             return filename
 

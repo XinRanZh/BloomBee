@@ -18,7 +18,7 @@ class DistributedGemma4Config(Gemma4TextConfig, ClientConfig, PTuneConfig, LMHea
 
     block_class = WrappedGemma4Block
     attn_class = Gemma4TextAttention
-    block_prefix = "model.layers"
+    block_prefix = "model.language_model.layers"
 
     num_key_value_groups = 1
 

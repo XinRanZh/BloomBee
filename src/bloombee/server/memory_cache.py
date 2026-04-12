@@ -251,8 +251,12 @@ class MemoryCache:
                         except Exception as e:
                             logger.debug(f"[MBPIPE_KV_DEBUG] Memory logging failed: {e}")
                     
+                    # Extract per-block head_dim from descriptor shape
+                    # (batch_size, num_heads, head_dim, max_length)
+                    descr_head_dim = descr.shape[2] if len(descr.shape) >= 3 else None
                     allocated_cache = self.device.init_cache_one_gpu_batch(
-                        self.block_config, self.mocked_task, override_policy
+                        self.block_config, self.mocked_task, override_policy,
+                        head_dim_override=descr_head_dim,
                     )
                     
                     # [MBPIPE_DEBUG] Log the allocated cache shape (handle different structures)

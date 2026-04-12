@@ -463,11 +463,11 @@ class TorchDevice:
             ids = last_token_logits.argmax(dim=1, keepdim=True)
         return TorchTensor.create_from_torch(ids, self)
 
-    def init_cache_one_gpu_batch(self, config, task, policy):
+    def init_cache_one_gpu_batch(self, config, task, policy, head_dim_override=None):
         num_attention_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        head_dim = getattr(config, "head_dim", None) or hidden_size // num_attention_heads
+        head_dim = head_dim_override or getattr(config, "head_dim", None) or hidden_size // num_attention_heads
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
@@ -1054,11 +1054,11 @@ class TorchDisk:
         if os.path.exists(tensor.data) and tensor.delete_file:
             os.remove(tensor.data)
 
-    def init_cache_one_gpu_batch(self, config, task, policy):
+    def init_cache_one_gpu_batch(self, config, task, policy, head_dim_override=None):
         num_attention_heads, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.num_attention_heads, config.hidden_size, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
-        head_dim = getattr(config, "head_dim", None) or hidden_size // num_attention_heads
+        head_dim = head_dim_override or getattr(config, "head_dim", None) or hidden_size // num_attention_heads
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_attention_heads, head_dim)
         k_cache = self.allocate(shape, np.float16)
         v_cache = self.allocate(shape, np.float16)

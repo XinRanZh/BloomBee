@@ -2,6 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 from transformers.cache_utils import DynamicCache
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 from bloombee.utils.cache_compat import make_past_kv_cache, make_empty_kv_cache, read_kv_from_cache
 
@@ -16,32 +17,39 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
     """Wraps Gemma4TextDecoderLayer for BloomBee's distributed block-serving protocol.
 
     BloomBee calls each block with:
-        forward(hidden_states, layer_past=(k,v), attention_mask=..., use_cache=True, position_ids=...)
+        forward(hidden_states, layer_past=(k,v), attention_mask=..., use_cache=True)
     and expects:
         (hidden_states, present_key_value) where present_key_value is (k_new, v_new)
 
     Gemma4TextDecoderLayer expects:
-        forward(hidden_states, position_embeddings=(cos,sin), attention_mask=..., past_key_values=Cache, ...)
+        forward(hidden_states, position_embeddings=(cos,sin), attention_mask=4D_mask,
+                past_key_values=Cache, shared_kv_states=dict, ...)
     and returns:
         hidden_states (cache updated in-place)
+
+    Key Gemma4 quirks handled here:
+    - Heterogeneous layers: sliding_attention (16 KV heads, D=256) vs
+      full_attention (4 KV heads, D=512). Q head_dim is always 256.
+    - Gemma4 does NOT build causal masks internally — we must provide the
+      correct per-layer-type mask (causal for full, sliding-window for sliding).
+    - shared_kv_states: cross-layer KV sharing dict. In distributed mode each
+      server handles a contiguous block range; we thread a shared dict through
+      all local layers on a given forward pass.
     """
 
     def __init__(self, config: Gemma4TextConfig, layer_idx: int):
         super().__init__(config, layer_idx)
         self.layer_idx = layer_idx
-        # Create rotary embedding for this block (normally lives in the model)
+        self._config = config
         self._rotary_emb = Gemma4TextRotaryEmbedding(config)
-        # Determine layer type for rotary
         self._layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else "full_attention"
-        # Gemma4 uses DIFFERENT head_dim for Q vs KV in full_attention layers
-        # (Q head_dim=256, KV head_dim=512). Standard GQA assumes same head_dim.
-        # We must derive correct kv_head_dim for cache allocation.
+
+        # Derive actual per-layer KV dimensions from weights (not config).
         attn = self.self_attn
         kv_groups = getattr(attn, "num_key_value_groups", 1)
         actual_kv_heads = config.num_attention_heads // kv_groups
         kv_head_dim = attn.k_proj.weight.shape[0] // actual_kv_heads
         attn.num_key_value_heads = actual_kv_heads
-        # Store kv_head_dim for cache allocation (may differ from config.head_dim)
         self._kv_head_dim = kv_head_dim
         if not hasattr(attn, "num_heads"):
             attn.num_heads = config.num_attention_heads
@@ -73,42 +81,47 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
         elif use_cache:
             past_key_values = make_empty_kv_cache(self.layer_idx)
 
-        # --- Compute position_ids and position_embeddings ---
-        position_ids = torch.arange(
-            past_key_values_length, seq_length + past_key_values_length,
-            dtype=torch.long, device=hidden_states.device
-        ).unsqueeze(0).expand(batch_size, -1)
-
-        position_embeddings = self._rotary_emb(hidden_states, position_ids, self._layer_type)
-
-        # tf 5.x attention implementations handle causal masking internally when mask=None.
-        attention_mask = None
-
-        # tf 5.x needs cache_position so DynamicCache knows where to write new KV.
-        # Without it, the cache is not updated and decode reads stale/empty data.
+        # --- Position IDs & cache_position ---
         cache_position = torch.arange(
             past_key_values_length, past_key_values_length + seq_length,
             dtype=torch.long, device=hidden_states.device,
         )
+        position_ids = cache_position.unsqueeze(0).expand(batch_size, -1)
 
-        # Filter kwargs that conflict with our explicit args
+        # --- Rotary position embeddings (per layer type) ---
+        position_embeddings = self._rotary_emb(hidden_states, position_ids, self._layer_type)
+
+        # --- Build correct causal mask (Gemma4 does NOT create masks internally) ---
+        mask_kwargs = dict(
+            config=self._config,
+            input_embeds=hidden_states,
+            attention_mask=None,  # no padding mask in BloomBee
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
+        if self._layer_type == "sliding_attention":
+            causal_mask = create_sliding_window_causal_mask(**mask_kwargs)
+        else:
+            causal_mask = create_causal_mask(**mask_kwargs)
+
+        # --- Call native forward ---
         skip_keys = {'position_ids', 'attention_mask', 'use_cache', 'position_embeddings',
                      'past_key_value', 'past_key_values', 'cache_position', 'shared_kv_states'}
         extra_kwargs = {k: v for k, v in kwargs.items() if k not in skip_keys}
 
-        # --- Call native forward ---
         outputs = super().forward(
             hidden_states,
             position_embeddings=position_embeddings,
-            attention_mask=attention_mask,
-            shared_kv_states={},  # No cross-layer KV sharing in distributed mode
+            attention_mask=causal_mask,
+            shared_kv_states=kwargs.get("shared_kv_states", {}),
             past_key_values=past_key_values,
             position_ids=position_ids,
             cache_position=cache_position,
             **extra_kwargs,
         )
 
-        # Extract hidden_states (tf 5.x may return tensor or tuple)
+        # Extract hidden_states (tf 5.x returns tensor; cache updated in-place)
         if isinstance(outputs, torch.Tensor):
             output_hidden = outputs
         elif isinstance(outputs, tuple):
@@ -116,11 +129,10 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
         else:
             output_hidden = outputs
 
-        # --- Extract updated cache and convert back to BloomBee format ---
+        # --- Extract NEW KV tokens from in-place-updated cache ---
         if use_cache and past_key_values is not None:
             pk, pv = read_kv_from_cache(past_key_values, self.layer_idx)
             if pk is not None:
-                # Only keep NEW tokens (BloomBee manages cumulative cache externally)
                 pk = pk[:, :, past_key_values_length:, :]
                 pv = pv[:, :, past_key_values_length:, :]
                 present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
@@ -131,22 +143,17 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
     def _reorder_cache_from_bloom(
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int
     ) -> Tuple[torch.Tensor]:
-        """Convert BloomBee cache format to HF [B, H, S, D] format."""
+        """Convert BloomBee cache [B*H, D, S] / [B*H, S, D] to HF [B, H, S, D]."""
         key_states, value_states = key_value
         if key_states.dim() == 4:
-            # Already [B, H, S, D] — just slice to valid KV heads
-            nkv = self.self_attn.config.num_key_value_heads
-            if hasattr(self.self_attn, 'num_key_value_heads'):
-                nkv = self.self_attn.num_key_value_heads
-            elif hasattr(self.self_attn, 'num_key_value_groups'):
-                nkv = self.self_attn.config.num_attention_heads // self.self_attn.num_key_value_groups
+            nkv = self.self_attn.num_key_value_heads
             key_states = key_states[:, :nkv, :, :]
             value_states = value_states[:, :nkv, :, :]
             return (key_states, value_states)
-        # 3D case: key is [B*H, D, S], value is [B*H, S, D]
-        head_dim = self.self_attn.head_dim
+        # 3D bloom format
         nkv = key_states.shape[0] // batch_size
-        key_states = key_states.permute(0, 2, 1)  # [B*H, D, S] -> [B*H, S, D]
+        head_dim = key_states.shape[1]  # key is [B*H, D, S]
+        key_states = key_states.permute(0, 2, 1)  # -> [B*H, S, D]
         key_states = key_states.view(batch_size, nkv, seq_length, head_dim)
         value_states = value_states.view(batch_size, nkv, seq_length, head_dim)
         return (key_states, value_states)
@@ -160,5 +167,5 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
         nkv = key_states.shape[1]
         value_states = value_states.reshape(batch_size * nkv, seq_length, head_dim)
         key_states = key_states.reshape(batch_size * nkv, seq_length, head_dim)
-        key_states = key_states.permute(0, 2, 1)  # [B*H, S, D] -> [B*H, D, S]
+        key_states = key_states.permute(0, 2, 1)  # -> [B*H, D, S]
         return (key_states, value_states)

@@ -10,9 +10,12 @@ from hivemind.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Use HuggingFace's default cache dir so models downloaded via `huggingface-cli download`
+# are found automatically. Users who relied on ~/.cache/bloombee can set BLOOMBEE_CACHE.
+_bloombee_cache = Path(Path.home(), ".cache", "bloombee")
 DEFAULT_CACHE_DIR = os.getenv(
     "BLOOMBEE_CACHE",
-    os.getenv("HF_HOME", os.path.join(huggingface_hub.constants.HF_HUB_CACHE)),
+    str(_bloombee_cache) if _bloombee_cache.exists() else huggingface_hub.constants.HF_HUB_CACHE,
 )
 
 BLOCKS_LOCK_FILE = "blocks.lock"

@@ -74,22 +74,40 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
 
         position_embeddings = self._rotary_emb(hidden_states, position_ids, self._layer_type)
 
-        # --- Build attention mask ---
-        # Gemma4 native attention handles masking internally via the attention implementation.
-        # We pass a causal mask. For simplicity, pass None and let the attention build it.
-        # The native Gemma4 attention expects a 4D mask or None.
-        causal_mask = None  # Let the native attention handle causal masking
+        # tf 5.x attention implementations handle causal masking internally when mask=None.
+        attention_mask = None
+
+        # tf 5.x needs cache_position so DynamicCache knows where to write new KV.
+        # Without it, the cache is not updated and decode reads stale/empty data.
+        cache_position = torch.arange(
+            past_key_values_length, past_key_values_length + seq_length,
+            dtype=torch.long, device=hidden_states.device,
+        )
+
+        # Filter kwargs that conflict with our explicit args
+        skip_keys = {'position_ids', 'attention_mask', 'use_cache', 'position_embeddings',
+                     'past_key_value', 'past_key_values', 'cache_position', 'shared_kv_states'}
+        extra_kwargs = {k: v for k, v in kwargs.items() if k not in skip_keys}
 
         # --- Call native forward ---
-        # Gemma4TextDecoderLayer.forward returns just hidden_states (cache updated in-place)
-        output_hidden = super().forward(
+        outputs = super().forward(
             hidden_states,
             position_embeddings=position_embeddings,
-            attention_mask=causal_mask,
+            attention_mask=attention_mask,
             shared_kv_states={},  # No cross-layer KV sharing in distributed mode
             past_key_values=past_key_values,
             position_ids=position_ids,
+            cache_position=cache_position,
+            **extra_kwargs,
         )
+
+        # Extract hidden_states (tf 5.x may return tensor or tuple)
+        if isinstance(outputs, torch.Tensor):
+            output_hidden = outputs
+        elif isinstance(outputs, tuple):
+            output_hidden = outputs[0]
+        else:
+            output_hidden = outputs
 
         # --- Extract updated cache and convert back to BloomBee format ---
         if use_cache and past_key_values is not None:

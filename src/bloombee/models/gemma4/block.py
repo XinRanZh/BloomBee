@@ -34,12 +34,13 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
         # Determine layer type for rotary
         self._layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else "full_attention"
         # Gemma4 sliding vs full attention layers have different KV head counts
-        # and possibly different head_dim. Derive from actual weight shapes.
+        # AND different head_dim (sliding=256, full=512). Config only stores one value.
+        # Derive actual per-layer values from weight shapes.
         attn = self.self_attn
-        head_dim = attn.head_dim if hasattr(attn, "head_dim") else config.head_dim
-        actual_kv_heads = attn.k_proj.weight.shape[0] // head_dim
-        if not hasattr(attn, "num_key_value_heads"):
-            attn.num_key_value_heads = actual_kv_heads
+        actual_head_dim = attn.q_proj.weight.shape[0] // config.num_attention_heads
+        actual_kv_heads = attn.k_proj.weight.shape[0] // actual_head_dim
+        attn.head_dim = actual_head_dim
+        attn.num_key_value_heads = actual_kv_heads
         if not hasattr(attn, "num_heads"):
             attn.num_heads = config.num_attention_heads
 

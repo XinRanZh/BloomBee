@@ -122,10 +122,16 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self.dtype = backend_dtype
         self.dtype_bytes = get_size_in_bytes(self.dtype)
         self.shard_num_heads = []
+        # Detect per-block head_dim from actual attention weights.
+        # Critical for Gemma4: sliding layers use head_dim=256, full layers use 512.
+        _block_head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
         for shard in self.module.module_shards:
             for submodule in shard.modules():
                 if isinstance(submodule, config.attn_class):
                     self.shard_num_heads.append(submodule.num_heads)
+                    if hasattr(submodule, "q_proj"):
+                        _block_head_dim = submodule.q_proj.weight.shape[0] // config.num_attention_heads
+        self.block_head_dim = _block_head_dim
         assert len(self.shard_num_heads) == len(self.module.devices)
         assert sum(self.shard_num_heads) == config.num_attention_heads
 
@@ -192,18 +198,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
 
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
         """Create tensor descriptors for attention cache tensors used during inference_step"""
-        # Derive per-block head_dim from the actual attention weights, not config.
-        # Gemma4 has different head_dim per layer type (sliding=256, full=512) but
-        # config.head_dim is a single value. We compute from q_proj weight shape.
-        # Backward compatible: for uniform models the computed value matches config.
-        head_dim = getattr(self.config, "head_dim", None) or self.config.hidden_size // self.config.num_attention_heads
-        for shard in self.module.module_shards:
-            for submodule in shard.modules():
-                if isinstance(submodule, self.config.attn_class):
-                    if hasattr(submodule, "q_proj"):
-                        head_dim = submodule.q_proj.weight.shape[0] // self.config.num_attention_heads
-                    break
-            break  # Only need the first shard's attention
+        head_dim = self.block_head_dim
         cache_tensors = []
         for device, num_heads in zip(self.module.devices, self.shard_num_heads):
             # IMPORTANT:

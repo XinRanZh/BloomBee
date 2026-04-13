@@ -20,6 +20,9 @@ class DistributedGemma4Config(Gemma4TextConfig, ClientConfig, PTuneConfig, LMHea
     attn_class = Gemma4TextAttention
     block_prefix = "model.language_model.layers"
 
+    # Conservative default: treat as standard MHA for cache budgeting.
+    # Gemma4 has per-layer KV head counts (sliding=2, full=8), but the config
+    # is shared across all blocks. Using 1 overestimates cache size (safe).
     num_key_value_groups = 1
 
     @classmethod

@@ -130,7 +130,8 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
         # Without this, attention would read/write at the real layer_idx (e.g. 30)
         # while past KV sits at index 0 → cache split → bmm shape mismatch.
         skip_keys = {'position_ids', 'attention_mask', 'use_cache', 'position_embeddings',
-                     'past_key_value', 'past_key_values', 'cache_position', 'shared_kv_states'}
+                     'past_key_value', 'past_key_values', 'cache_position', 'shared_kv_states',
+                     'rotary_position_ids'}  # BloomBee-specific kwarg, not used by Gemma4
         extra_kwargs = {k: v for k, v in kwargs.items() if k not in skip_keys}
 
         original_attn_layer_idx = self.self_attn.layer_idx
@@ -170,6 +171,11 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
                 pk = pk[:, :, past_key_values_length:, :]
                 pv = pv[:, :, past_key_values_length:, :]
                 present_key_value = self._reorder_cache_to_bloom((pk, pv), batch_size, seq_length)
+                # DEBUG: verify KV shapes match expected per-layer dims
+                _kv_k, _kv_v = present_key_value
+                print(f"[GEMMA4_DBG] L{self.layer_idx} new_kv: k={_kv_k.shape} v={_kv_v.shape} "
+                      f"(expect nkv={self._num_kv_heads} D={self._kv_head_dim})",
+                      file=sys.stderr, flush=True)
                 return (output_hidden, present_key_value)
 
         return (output_hidden, None)

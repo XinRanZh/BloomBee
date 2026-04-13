@@ -115,20 +115,29 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
             causal_mask = create_causal_mask(**mask_kwargs)
 
         # --- Call native forward ---
+        # Override self_attn.layer_idx so the native attention reads/writes
+        # the DynamicCache at _cache_idx (0), matching where we stored past KV.
+        # Without this, attention would read/write at the real layer_idx (e.g. 30)
+        # while past KV sits at index 0 → cache split → bmm shape mismatch.
         skip_keys = {'position_ids', 'attention_mask', 'use_cache', 'position_embeddings',
                      'past_key_value', 'past_key_values', 'cache_position', 'shared_kv_states'}
         extra_kwargs = {k: v for k, v in kwargs.items() if k not in skip_keys}
 
-        outputs = super().forward(
-            hidden_states,
-            position_embeddings=position_embeddings,
-            attention_mask=causal_mask,
-            shared_kv_states=kwargs.get("shared_kv_states", {}),
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-            cache_position=cache_position,
-            **extra_kwargs,
-        )
+        original_attn_layer_idx = self.self_attn.layer_idx
+        self.self_attn.layer_idx = _cache_idx
+        try:
+            outputs = super().forward(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=causal_mask,
+                shared_kv_states=kwargs.get("shared_kv_states", {}),
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                **extra_kwargs,
+            )
+        finally:
+            self.self_attn.layer_idx = original_attn_layer_idx
 
         # Extract hidden_states (tf 5.x returns tensor; cache updated in-place)
         if isinstance(outputs, torch.Tensor):

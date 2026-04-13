@@ -147,20 +147,6 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
         else:
             output_hidden = outputs
 
-        # DEBUG: trace hidden state norms and cache state
-        import logging as _log
-        _dbg = _log.getLogger("gemma4.block.debug")
-        _in_norm = hidden_states.float().norm().item()
-        _out_norm = output_hidden.float().norm().item()
-        _mask_shape = causal_mask.shape if causal_mask is not None else None
-        _cache_len_after = past_key_values.get_seq_length() if past_key_values is not None else 0
-        _dbg.info(
-            f"L{self.layer_idx}({self._layer_type[:4]}) "
-            f"seq={seq_length} past={past_key_values_length} "
-            f"in_norm={_in_norm:.2f} out_norm={_out_norm:.2f} "
-            f"mask={_mask_shape} cache_after={_cache_len_after}"
-        )
-
         # --- Extract NEW KV tokens from in-place-updated cache ---
         if use_cache and past_key_values is not None:
             pk, pv = read_kv_from_cache(past_key_values, _cache_idx)

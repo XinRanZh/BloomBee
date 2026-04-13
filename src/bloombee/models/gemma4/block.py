@@ -66,6 +66,16 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
         batch_size, seq_length, _ = hidden_states.shape
         past_key_values_length = 0
 
+        # DEBUG TRACE (temporary)
+        _in_norm = hidden_states.float().norm().item()
+        _has_past = layer_past is not None
+        _past_shape = layer_past[0].shape if _has_past else None
+        import sys
+        print(f"[GEMMA4_DBG] L{self.layer_idx}({self._layer_type[:4]}) "
+              f"seq={seq_length} use_cache={use_cache} has_past={_has_past} "
+              f"past_shape={_past_shape} in_norm={_in_norm:.2f}",
+              file=sys.stderr, flush=True)
+
         # --- Convert BloomBee's layer_past to HF DynamicCache ---
         # IMPORTANT: always use layer_idx=0 for the per-block temporary cache.
         # In tf 5.x, DynamicCache.get_seq_length() defaults to layer 0.
@@ -146,6 +156,12 @@ class WrappedGemma4Block(Gemma4TextDecoderLayer):
             output_hidden = outputs[0]
         else:
             output_hidden = outputs
+
+        # DEBUG TRACE output
+        _out_norm = output_hidden.float().norm().item()
+        _cache_after = past_key_values.get_seq_length() if past_key_values is not None else 0
+        print(f"[GEMMA4_DBG] L{self.layer_idx} out_norm={_out_norm:.2f} cache_after={_cache_after}",
+              file=sys.stderr, flush=True)
 
         # --- Extract NEW KV tokens from in-place-updated cache ---
         if use_cache and past_key_values is not None:

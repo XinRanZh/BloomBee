@@ -28,7 +28,6 @@ except ImportError:
 from bloombee.constants import DTYPE_MAP
 from bloombee.models.mixtral import WrappedMixtralBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
-from bloombee.models.qwen3.block import WrappedQwen3Block
 try:
     from bloombee.models.gemma4.block import WrappedGemma4Block
 except ImportError:
@@ -83,7 +82,7 @@ def load_pretrained_block(
     torch_dtype = resolve_block_dtype(config, torch_dtype)
 
     # Determine if this is a FlexGen-managed model (Llama) or a standard HF model (Falcon, Mixtral)
-    _hf_block_classes = [WrappedFalconBlock, WrappedMixtralBlock, WrappedQwen3Block]
+    _hf_block_classes = [WrappedFalconBlock, WrappedMixtralBlock]
     if WrappedGemma4Block is not None:
         _hf_block_classes.append(WrappedGemma4Block)
     _is_hf_model = config.block_class in _hf_block_classes

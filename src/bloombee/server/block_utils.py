@@ -20,7 +20,6 @@ except ImportError:
     WrappedGemma4Block = None  # Gemma4 requires transformers >= 5.0
 from bloombee.models.mixtral.block import WrappedMixtralBlock
 from bloombee.models.falcon.block import WrappedFalconBlock
-from bloombee.models.qwen3.block import WrappedQwen3Block
 from bloombee.utils.convert_block import QuantType
 from bloombee.utils.misc import get_size_in_bytes
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
@@ -87,10 +86,6 @@ def get_model_block(config, env, policy, weight_home, path, layer_idx: int = 0):
         return config.block_class(config, layer_idx)
     elif config.block_class == WrappedMixtralBlock:
         dprint('server/block_utils.py config.block_class == WrappedMixtralBlock ')
-        config = _autoset_attn(config)
-        return config.block_class(config, layer_idx)
-    elif config.block_class == WrappedQwen3Block:
-        dprint('server/block_utils.py config.block_class == WrappedQwen3Block ')
         config = _autoset_attn(config)
         return config.block_class(config, layer_idx)
     elif config.block_class == WrappedFalconBlock:

@@ -106,12 +106,14 @@ E1–E4 同验，全部吻合。
 
 ## 6. 遗留问题 / 建议下一步（按 ROI 排序）
 
-1. **异构 batch 的逐行回退路径**（最大遗留）：seq_len 不等时 `can_batch_prefix=False` → 每行 `_build_tree_from_prefix_cache` + 每深度每 seed 一次 `_advance_cached` → b8het draft 高达 **242ms/轮**（同质 b8 才 ~37ms）。native emit 目前只覆盖全批等长的 batched 路径。方案：变长 prefix 的 batched prefill（padding/共长截断策略）+ 逐行 `prefix_next_pos`（position_ids 已支持 [B,S]），或 compactions 后重对齐。这是对真实异构流量最大的 draft 侧收益。
-2. **CUDA graph 化 native 扩展循环**：native 路径形状已静态（candidate arena、frontier F=K、tree_mask 按固定序列增长），可把 5 深度扩展 + 选择收录成图，消除本机 19-92µs/op 的启动开销（预估 draft 再降 5-10ms/轮）。障碍：EAGLE head 的 DynamicCache 会增长/crop——需预分配静态 KV buffer。
-3. **verifier 投影成本**：7 次 `[B,H]@[H,V]` 在 b8 略高于旧 Python 路径（+2.3ms），b32 持平。可考虑 lm_head int8/fp8 投影或与首步融合。
-4. **`_update_eagle_prefix_hidden_states` 与 `_update_input_ids_with_padding`** 仍是逐行 Python + 多次 `.item()`（GPU-tree 计划里的 Stage 4/5），每轮 4-16ms 量级，是树外下一个 per-round CPU 热点。
-5. **默认值决策**：目前全 flag-gated（默认关）。若 E2E 复验通过并决定转正，把 `BLOOMBEE_TENSOR_TREE=1` + `EMIT=1` 设为 greedy 默认；sampling 路径仍走对象树（需要 leaf paths + 概率）。
-6. **s2s_flow 的 @dataclass 修复应尽快单独合入主线**（一行，但当前主线 S2S 全坏）。
+**2026-08-06 更新：①③已完成并验证，②已尝试并留有证据。**
+
+1. ~~异构 batch 的逐行回退路径~~ **已完成（`78ffade`）**：`_prefill_with_prefix_batch_varlen` 把逐行 prefix cache 以"散乱布局"pad-merge 进单个 batch 缓存（每行 `[0,L_b)` 缓存段 + `[L_max, L_max+c_b)` 新后缀，slot==position → RoPE 精确），一次掩码后缀前向 + batched 扩展。het 实测：draft 241.7→36.7ms（b8）/ 328.2→56.3ms（b32），het tps +50%（b8）/+31%（b32），token 与逐行路径逐字节一致（8/8、32/32），accept 持平 3.150。**关键坑**：cache_len > target 时必须整条作废重建（否则 last_hidden 是未来位置的 hidden → accept 塌到 1.0 持续数轮）。开关 `BLOOMBEE_EAGLE_VARLEN_BATCH=0` 可回退逐行。
+2. **CUDA graph 化 native 扩展循环：已尝试，两条捷径均不可行**（远程实测）：`torch.compile(mode="reduce-overhead")` 报 `accessing tensor output of CUDAGraphs that has been overwritten`（DynamicCache 可变状态与 graph 重放冲突）；`mode="default"` 无增益（33.3ms vs 未编译 30.8ms——瓶颈是启动分发而非 kernel 融合）。**正路**：静态 KV buffer（预分配 `[B, MAX_W+tree]`，游标写入）替代 transformers DynamicCache 后手工录图；工程量较大，留给后续 PR。
+3. ~~b8 verifier 投影次数~~ **已完成（`40c8e34`）**：混合早退——前 4 步无同步，之后一次 `active.any()` 检查再决定是否走完剩余步数；token 完全一致（400/400 随机用例）。
+4. `_update_eagle_prefix_hidden_states` / `_update_input_ids_with_padding` 仍是逐行 Python + 多次 `.item()`，每轮 4-16ms，树外下一个 per-round CPU 热点。
+5. **默认值决策**：`BLOOMBEE_TENSOR_TREE=1` + `EMIT=1` + varlen（默认开）转正评估中（v3/v4 标准重测见 `results/gpu_tree_migration_2026-08-06/`）。sampling 仍走对象树。
+6. ~~s2s_flow 修复~~ **已开 PR #62**（hotfix/s2s-telemetry-dataclass → ai-decentralized/main）。
 
 ## 7. 复现/继续工作的最小命令集
 

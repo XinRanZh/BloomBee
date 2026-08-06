@@ -200,7 +200,16 @@ def greedy_verify_tensorized(
     accept_count = torch.zeros(B, dtype=torch.long, device=device_h)
     bidx = torch.arange(B, device=device_h)
 
+    # Hybrid early-exit: steady-state accepts end within ~3-4 steps, so running
+    # all max_steps lm_head projections wastes work on dead rows — but a per-step
+    # sync costs more. Compromise: run the first `early_exit_at` steps sync-free,
+    # then pay ONE host check; if any row is still active, finish the remaining
+    # steps sync-free. Token-identical: steps skipped when no row is active
+    # would all be no-ops (inactive rows can never match again).
+    early_exit_at = min(max_steps, 4)
     for _step in range(max_steps):
+        if _step == early_exit_at and not bool(active.any()):
+            break
         # Parent logits position per row (mirror _tree_parent_logits_position).
         is_root = active_node == 0
         pos_first = torch.where(is_root, seq_h - 1, seq_h + (active_node - 1))

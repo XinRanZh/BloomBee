@@ -431,6 +431,28 @@ class _PrefixBuildJob:
     prefix_next_pos: int
 
 
+@dataclass
+class _BatchPrefixContext:
+    """Shared batched EAGLE prefix state for VARIABLE-LENGTH rows (het batches).
+
+    The per-row prefix caches are merged into ONE batch work cache of W slots
+    with a scattered layout: row b's content lives at slots [0, L_b) (cached
+    prefix) and [L_max, L_max + c_b) (this round's suffix), so slot==position
+    holds per row and RoPE stays correct via explicit per-row position_ids.
+    `valid_mask[b, s]` marks the slots that hold real content for row b.
+    Tree keys during expansion are appended at uniform slots [W, ...) and
+    cropped after the round; per-row persistent states were already written
+    back as independent tensors during the prefill.
+    """
+
+    root_hiddens: torch.Tensor          # [B, H] drafter hidden at each row's root
+    work_cache: DynamicCache            # batch cache with W slots (scattered layout)
+    cache_len_w: int                    # W
+    valid_mask: torch.Tensor            # [B, W] bool
+    prefix_next_pos: List[int]          # per-row T_b (host ints)
+    root_tokens: List[int]              # per-row root token id (host ints)
+
+
 def _topk_per_layer_indices(layer_nodes: List[_CandNode], k: int) -> List[_CandNode]:
     """Pick top-k nodes from a single tree depth by cumulative path_log_p."""
     if k <= 0 or not layer_nodes:
@@ -939,6 +961,190 @@ class EAGLEDrafter:
         ]
 
     @torch.no_grad()
+    def _prefill_with_prefix_batch_varlen(
+        self,
+        prefix_hidden_states: torch.Tensor,   # [B, P, H], right-padded target hiddens
+        shifted_input_ids: torch.LongTensor,  # [B, P], right-padded shifted ids
+        *,
+        cache_keys: Sequence[int],
+        prefix_lens: Sequence[int],           # per-row true prefix length T_b (host)
+        root_tokens: Sequence[int],           # per-row root token id (host)
+    ) -> "_BatchPrefixContext":
+        """Batched shifted-prefix prefill for VARIABLE-length rows (het batches).
+
+        Merges each row's incremental prefix cache into one batch work cache in a
+        scattered layout (row b: [0, L_b) cached content + [L_max, L_max + c_b)
+        fresh suffix), runs ONE [B, S_max] drafter forward for all rows' new
+        tokens with a per-row additive mask, writes per-row persistent caches
+        back as independent tensors, and returns the shared context the batched
+        expansion consumes. Replaces the per-row `_prefill_with_prefix` +
+        `_build_tree_from_prefix_cache` fallback (O(B) sequential tiny forwards
+        per depth — the het-batch drafter bottleneck).
+        """
+        device = self.device
+        batch_size = int(shifted_input_ids.shape[0])
+        T = [max(0, int(x)) for x in prefix_lens]
+        shifted_cpu = shifted_input_ids.detach().cpu()
+
+        # Per-row cached length, validated by token-id prefix match (a row whose
+        # cached ids diverge rebuilds from scratch). Mirrors the single-row
+        # reference: a cache LONGER than the target is invalid — its K/V prefix
+        # is fine, but `last_hidden` would be a hidden from a FUTURE position
+        # (e.g. warmup runs longer than the main run's first root), which
+        # silently poisons the root conditioning.
+        L: List[int] = []
+        states: List[Optional[_PrefixCacheState]] = []
+        for b, cache_key in enumerate(cache_keys):
+            state = self._prefix_states.get(int(cache_key))
+            lb = 0
+            if state is not None and state.cache is not None and state.cache_ids is not None:
+                cand = int(state.cache_len)
+                if (
+                    0 < cand <= T[b]
+                    and state.cache_ids.shape[0] == 1
+                    and int(state.cache_ids.shape[1]) >= cand
+                    and torch.equal(state.cache_ids[:, :cand], shifted_cpu[b : b + 1, :cand])
+                ):
+                    lb = cand
+            states.append(state if lb > 0 else None)
+            L.append(lb)
+
+        C = [T[b] - L[b] for b in range(batch_size)]
+        L_max = max(L) if L else 0
+        S_max = max(C) if C else 0
+        W = L_max + S_max
+
+        # --- merge cached prefixes into one [B, L_max] batch cache (left-aligned) ---
+        if L_max > 0:
+            ref = next(st for st in states if st is not None)
+            n_layers = len(ref.cache.layers)
+            ddp_cache_data = []
+            for layer_idx in range(n_layers):
+                ref_layer = ref.cache.layers[layer_idx]
+                k_ref = getattr(ref_layer, "keys")
+                v_ref = getattr(ref_layer, "values")
+                k_buf = k_ref.new_zeros(batch_size, k_ref.shape[1], L_max, k_ref.shape[3])
+                v_buf = v_ref.new_zeros(batch_size, v_ref.shape[1], L_max, v_ref.shape[3])
+                for b, state in enumerate(states):
+                    if state is None:
+                        continue
+                    layer = state.cache.layers[layer_idx]
+                    k_buf[b : b + 1, :, : L[b]] = getattr(layer, "keys")[:, :, : L[b]]
+                    v_buf[b : b + 1, :, : L[b]] = getattr(layer, "values")[:, :, : L[b]]
+                ddp_cache_data.append((k_buf, v_buf))
+            work_cache = DynamicCache(ddp_cache_data=ddp_cache_data, config=self.head_cfg)
+        else:
+            work_cache = DynamicCache(config=self.head_cfg)
+
+        # --- batched suffix forward (rows with no new tokens ride along masked) ---
+        if S_max > 0:
+            new_hidden = torch.zeros(batch_size, S_max, prefix_hidden_states.shape[2],
+                                     device=device, dtype=self.dtype)
+            new_ids = torch.zeros(batch_size, S_max, dtype=torch.long, device=device)
+            pos_ids = torch.zeros(batch_size, S_max, dtype=torch.long, device=device)
+            for b in range(batch_size):
+                c = C[b]
+                if c <= 0:
+                    continue
+                l = L[b]
+                new_hidden[b, :c] = prefix_hidden_states[b, l : T[b]].to(device=device, dtype=self.dtype)
+                new_ids[b, :c] = shifted_input_ids[b, l : T[b]].to(device)
+                pos_ids[b, :c] = torch.arange(l, T[b], device=device, dtype=torch.long)
+
+            s_ar = torch.arange(W, device=device)
+            i_ar = torch.arange(S_max, device=device)
+            L_vec = torch.tensor(L, device=device, dtype=torch.long).view(batch_size, 1, 1)
+            C_vec = torch.tensor(C, device=device, dtype=torch.long).view(batch_size, 1, 1)
+            allow = (s_ar.view(1, 1, W) < L_vec).expand(batch_size, S_max, W)     # cached prefix
+            j = s_ar.view(1, 1, W) - L_max                                        # suffix slot index
+            allow = allow | ((j >= 0) & (j <= i_ar.view(1, S_max, 1)) & (j < C_vec))  # causal new tokens
+            neg_inf = torch.finfo(self.dtype).min
+            attn_mask = torch.zeros(batch_size, S_max, W, dtype=self.dtype, device=device)
+            attn_mask = attn_mask.masked_fill(~allow, neg_inf).unsqueeze(1)
+
+            h_drf, work_cache = self._step(
+                hidden_states=new_hidden,
+                input_ids=new_ids,
+                position_ids=pos_ids,
+                past_key_values=work_cache,
+                attention_mask=attn_mask,
+            )
+            h_drf = h_drf.detach()
+        else:
+            h_drf = None
+
+        # --- per-row root hidden + persistent cache/state write-back ---
+        root_hiddens: List[torch.Tensor] = []
+        for b, cache_key in enumerate(cache_keys):
+            state = states[b]
+            if C[b] > 0:
+                root_hidden_b = h_drf[b, C[b] - 1].detach()
+                new_state = state if state is not None else _PrefixCacheState(
+                    cache=DynamicCache(config=self.head_cfg), cache_len=0
+                )
+                ddp_cache_data = []
+                for layer_idx in range(len(work_cache.layers)):
+                    layer = work_cache.layers[layer_idx]
+                    key = getattr(layer, "keys")
+                    value = getattr(layer, "values")
+                    parts_k = []
+                    parts_v = []
+                    if L[b] > 0:
+                        parts_k.append(key[b : b + 1, :, : L[b]])
+                        parts_v.append(value[b : b + 1, :, : L[b]])
+                    parts_k.append(key[b : b + 1, :, L_max : L_max + C[b]])
+                    parts_v.append(value[b : b + 1, :, L_max : L_max + C[b]])
+                    ddp_cache_data.append((
+                        torch.cat(parts_k, dim=2).detach().clone().contiguous(),
+                        torch.cat(parts_v, dim=2).detach().clone().contiguous(),
+                    ))
+                new_state.cache = DynamicCache(ddp_cache_data=ddp_cache_data, config=self.head_cfg)
+                new_state.cache_len = T[b]
+                new_state.cache_ids = shifted_cpu[b : b + 1, : T[b]].clone()
+                new_state.last_hidden = root_hidden_b
+                self._prefix_states[int(cache_key)] = new_state
+            else:
+                if state is None or state.last_hidden is None:
+                    raise RuntimeError("EAGLE prefix varlen cache is populated without a last hidden state")
+                root_hidden_b = state.last_hidden.to(device=device, dtype=self.dtype)
+            root_hiddens.append(root_hidden_b)
+
+        # --- scattered validity mask over the W work-cache slots ---
+        valid_mask = torch.zeros(batch_size, W, dtype=torch.bool, device=device)
+        for b in range(batch_size):
+            if L[b] > 0:
+                valid_mask[b, : L[b]] = True
+            if C[b] > 0:
+                valid_mask[b, L_max : L_max + C[b]] = True
+
+        return _BatchPrefixContext(
+            root_hiddens=torch.stack(root_hiddens, dim=0),
+            work_cache=work_cache,
+            cache_len_w=W,
+            valid_mask=valid_mask,
+            prefix_next_pos=T,
+            root_tokens=[int(t) for t in root_tokens],
+        )
+
+    def _tree_attention_mask_varlen(
+        self,
+        tree_mask: torch.Tensor,      # [B, q, tree_cols] bool
+        valid_mask: torch.Tensor,     # [B, W] bool over work-cache slots
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Additive EAGLE tree mask over a scattered per-row prefix layout."""
+        tree_mask = tree_mask.to(device=self.device, dtype=torch.bool)
+        batch_size, q_len, tree_cols = tree_mask.shape
+        W = int(valid_mask.shape[1])
+        neg_inf = torch.finfo(dtype).min
+        additive = torch.zeros(
+            (batch_size, q_len, W + tree_cols), dtype=dtype, device=self.device
+        )
+        additive[:, :, :W] = additive[:, :, :W].masked_fill(~valid_mask.unsqueeze(1), neg_inf)
+        additive[:, :, W:] = additive[:, :, W:].masked_fill(~tree_mask, neg_inf)
+        return additive.unsqueeze(1)
+
+    @torch.no_grad()
     def _prefill_with_prefix(
         self,
         prefix_hidden_states: torch.Tensor,   # [1, P, H], target hiddens before root
@@ -1067,46 +1273,62 @@ class EAGLEDrafter:
     def _build_trees_from_prefix_caches_batched(
         self,
         *,
-        jobs: Sequence[_PrefixBuildJob],
+        jobs: Optional[Sequence[_PrefixBuildJob]] = None,
         max_candidate_depth: int,
         total_token: int,
         expansion_width: int,
+        prefix_ctx: Optional[_BatchPrefixContext] = None,
     ) -> List[SpeculativeTree]:
         """Batched EAGLE-2 tree expansion for same-length prefix caches.
 
         This is the latency-critical path for batch inference. It keeps the
         EAGLE dynamic tree algorithm identical to the single-row path, but runs
         each expansion depth as one `[B, K]` head forward instead of `B`
-        independent `[1, K]` forwards.
+        independent `[1, K]` forwards. With `prefix_ctx` (variable-length het
+        batches) the per-row prefix lengths come from the context's scattered
+        validity mask instead of a shared scalar.
         """
-        if not jobs:
-            return []
-        if len(jobs) == 1:
-            job = jobs[0]
-            return [
-                self._build_tree_from_prefix_cache(
-                    root_tok=job.root_token,
-                    root_hidden=job.root_hidden,
-                    prefix_cache=job.prefix_cache,
-                    prefix_next_pos=job.prefix_next_pos,
-                    max_candidate_depth=max_candidate_depth,
-                    total_token=total_token,
-                    expansion_width=expansion_width,
-                )
-            ]
+        if prefix_ctx is not None:
+            batch_size = int(prefix_ctx.root_hiddens.shape[0])
+            K = max(1, int(expansion_width))
+            root_hiddens = prefix_ctx.root_hiddens.to(device=self.device, dtype=self.dtype)
+            root_tokens = list(prefix_ctx.root_tokens)
+            work_cache = prefix_ctx.work_cache
+            prefix_len_scalar = prefix_ctx.cache_len_w
+            pos_base = torch.tensor(prefix_ctx.prefix_next_pos, dtype=torch.long, device=self.device)
+            valid_mask = prefix_ctx.valid_mask
+        else:
+            if not jobs:
+                return []
+            if len(jobs) == 1:
+                job = jobs[0]
+                return [
+                    self._build_tree_from_prefix_cache(
+                        root_tok=job.root_token,
+                        root_hidden=job.root_hidden,
+                        prefix_cache=job.prefix_cache,
+                        prefix_next_pos=job.prefix_next_pos,
+                        max_candidate_depth=max_candidate_depth,
+                        total_token=total_token,
+                        expansion_width=expansion_width,
+                    )
+                ]
 
-        prefix_next_pos = int(jobs[0].prefix_next_pos)
-        if any(int(job.prefix_next_pos) != prefix_next_pos for job in jobs):
-            raise ValueError("Batched EAGLE tree expansion requires same-length prefix caches")
+            prefix_next_pos = int(jobs[0].prefix_next_pos)
+            if any(int(job.prefix_next_pos) != prefix_next_pos for job in jobs):
+                raise ValueError("Batched EAGLE tree expansion requires same-length prefix caches")
 
-        batch_size = len(jobs)
-        K = max(1, int(expansion_width))
-        root_hiddens = torch.stack(
-            [job.root_hidden.to(device=self.device, dtype=self.dtype) for job in jobs],
-            dim=0,
-        )
-        root_tokens = [int(job.root_token) for job in jobs]
-        work_cache = self._merge_prefix_caches_batch([job.prefix_cache for job in jobs])
+            batch_size = len(jobs)
+            K = max(1, int(expansion_width))
+            root_hiddens = torch.stack(
+                [job.root_hidden.to(device=self.device, dtype=self.dtype) for job in jobs],
+                dim=0,
+            )
+            root_tokens = [int(job.root_token) for job in jobs]
+            work_cache = self._merge_prefix_caches_batch([job.prefix_cache for job in jobs])
+            prefix_len_scalar = prefix_next_pos
+            pos_base = None
+            valid_mask = None
 
         logits0 = self._logits(root_hiddens)
         top0 = self._topk_logprobs(logits0, k=K)
@@ -1190,13 +1412,19 @@ class EAGLEDrafter:
                     seed_token_rows, device=self.device, dtype=torch.long
                 )
 
-                position_ids = torch.full(
-                    (batch_size, current_seed_count),
-                    int(prefix_next_pos + depth - 1),
-                    device=self.device,
-                    dtype=torch.long,
-                )
-                attn_mask = self._tree_attention_mask(tree_mask, int(prefix_next_pos), self.dtype)
+                if pos_base is not None:
+                    position_ids = (pos_base.unsqueeze(1) + int(depth - 1)).expand(
+                        batch_size, current_seed_count
+                    )
+                    attn_mask = self._tree_attention_mask_varlen(tree_mask, valid_mask, self.dtype)
+                else:
+                    position_ids = torch.full(
+                        (batch_size, current_seed_count),
+                        int(prefix_len_scalar + depth - 1),
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                    attn_mask = self._tree_attention_mask(tree_mask, int(prefix_len_scalar), self.dtype)
                 out_hidden, work_cache = self._step(
                     hidden_states=parent_hiddens,
                     input_ids=seed_input_ids,
@@ -1277,7 +1505,7 @@ class EAGLEDrafter:
                 seeds_by_batch = next_seeds_by_batch
         finally:
             if hasattr(work_cache, "crop"):
-                work_cache.crop(int(prefix_next_pos))
+                work_cache.crop(int(prefix_len_scalar))
 
         m = max(0, int(total_token) - 1)
         trees: List[SpeculativeTree] = []
@@ -1291,12 +1519,13 @@ class EAGLEDrafter:
     def _build_tensor_tree_batched(
         self,
         *,
-        jobs: Sequence[_PrefixBuildJob],
+        jobs: Optional[Sequence[_PrefixBuildJob]] = None,
         max_candidate_depth: int,
         total_token: int,
         expansion_width: int,
         pad_token_id: int = 0,
         root_tokens_gpu: Optional[torch.Tensor] = None,
+        prefix_ctx: Optional[_BatchPrefixContext] = None,
     ) -> TensorTreeBatch:
         """Native GPU-tree variant of `_build_trees_from_prefix_caches_batched`.
 
@@ -1320,29 +1549,47 @@ class EAGLEDrafter:
         bit-identical to `_topm_global` + `_close_under_parents` +
         `_bind_into_speculative_tree` + DFS (scripts/test_native_tensor_tree.py).
         """
-        if len(jobs) < 2:
-            raise ValueError("Native tensor-tree emit is only defined for batched jobs")
-
-        prefix_next_pos = int(jobs[0].prefix_next_pos)
-        if any(int(job.prefix_next_pos) != prefix_next_pos for job in jobs):
-            raise ValueError("Batched EAGLE tree expansion requires same-length prefix caches")
-
-        batch_size = len(jobs)
-        K = max(1, int(expansion_width))
-        device = self.device
-        root_hiddens = torch.stack(
-            [job.root_hidden.to(device=device, dtype=self.dtype) for job in jobs],
-            dim=0,
-        )
-        root_tokens = [int(job.root_token) for job in jobs]
-        # Prefer a device-resident root token tensor: `torch.tensor(list,
-        # device=cuda)` issues a synchronous pageable H2D copy that stalls the
-        # stream (measured ~ms-scale on multi-GPU hosts); a GPU-side gather is free.
-        if root_tokens_gpu is None:
-            root_tokens_t = torch.tensor(root_tokens, dtype=torch.long, device=device)
+        if prefix_ctx is not None:
+            batch_size = int(prefix_ctx.root_hiddens.shape[0])
+            K = max(1, int(expansion_width))
+            device = self.device
+            root_hiddens = prefix_ctx.root_hiddens.to(device=device, dtype=self.dtype)
+            root_tokens = list(prefix_ctx.root_tokens)
+            if root_tokens_gpu is None:
+                root_tokens_t = torch.tensor(root_tokens, dtype=torch.long, device=device)
+            else:
+                root_tokens_t = root_tokens_gpu.to(device=device, dtype=torch.long)
+            work_cache = prefix_ctx.work_cache
+            prefix_len_scalar = prefix_ctx.cache_len_w   # W (uniform batch width)
+            pos_base = torch.tensor(prefix_ctx.prefix_next_pos, dtype=torch.long, device=device)
+            valid_mask = prefix_ctx.valid_mask
         else:
-            root_tokens_t = root_tokens_gpu.to(device=device, dtype=torch.long)
-        work_cache = self._merge_prefix_caches_batch([job.prefix_cache for job in jobs])
+            if len(jobs) < 2:
+                raise ValueError("Native tensor-tree emit is only defined for batched jobs")
+
+            prefix_next_pos = int(jobs[0].prefix_next_pos)
+            if any(int(job.prefix_next_pos) != prefix_next_pos for job in jobs):
+                raise ValueError("Batched EAGLE tree expansion requires same-length prefix caches")
+
+            batch_size = len(jobs)
+            K = max(1, int(expansion_width))
+            device = self.device
+            root_hiddens = torch.stack(
+                [job.root_hidden.to(device=device, dtype=self.dtype) for job in jobs],
+                dim=0,
+            )
+            root_tokens = [int(job.root_token) for job in jobs]
+            # Prefer a device-resident root token tensor: `torch.tensor(list,
+            # device=cuda)` issues a synchronous pageable H2D copy that stalls the
+            # stream (measured ~ms-scale on multi-GPU hosts); a GPU-side gather is free.
+            if root_tokens_gpu is None:
+                root_tokens_t = torch.tensor(root_tokens, dtype=torch.long, device=device)
+            else:
+                root_tokens_t = root_tokens_gpu.to(device=device, dtype=torch.long)
+            work_cache = self._merge_prefix_caches_batch([job.prefix_cache for job in jobs])
+            prefix_len_scalar = prefix_next_pos
+            pos_base = None
+            valid_mask = None
 
         logits0 = self._logits(root_hiddens)
         top0 = self._topk_logprobs(logits0, k=K)
@@ -1396,13 +1643,21 @@ class EAGLEDrafter:
                 if frontier_size == 0:
                     break
 
-                position_ids = torch.full(
-                    (batch_size, frontier_size),
-                    int(prefix_next_pos + depth - 1),
-                    device=device,
-                    dtype=torch.long,
-                )
-                attn_mask = self._tree_attention_mask(tree_mask, int(prefix_next_pos), self.dtype)
+                if pos_base is not None:
+                    # Varlen (het) layout: per-row prefix length T_b -> per-row
+                    # positions; mask covers the scattered cache validity.
+                    position_ids = (pos_base.unsqueeze(1) + int(depth - 1)).expand(
+                        batch_size, frontier_size
+                    )
+                    attn_mask = self._tree_attention_mask_varlen(tree_mask, valid_mask, self.dtype)
+                else:
+                    position_ids = torch.full(
+                        (batch_size, frontier_size),
+                        int(prefix_len_scalar + depth - 1),
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    attn_mask = self._tree_attention_mask(tree_mask, int(prefix_len_scalar), self.dtype)
                 out_hidden, work_cache = self._step(
                     hidden_states=frontier_parent_hidden,
                     input_ids=frontier_token,
@@ -1461,7 +1716,7 @@ class EAGLEDrafter:
                 offset += n_child
         finally:
             if hasattr(work_cache, "crop"):
-                work_cache.crop(int(prefix_next_pos))
+                work_cache.crop(int(prefix_len_scalar))
 
         return tensor_tree_from_eagle_candidate_tensors(
             root_tokens=root_tokens_t,
@@ -1866,6 +2121,93 @@ class EAGLEDrafter:
                 except Exception as e:
                     logger.debug(
                         "[EAGLEDrafter] batched prefix prefill failed; falling back row-wise: %s",
+                        e,
+                        exc_info=True,
+                    )
+            varlen_prefix = (
+                not can_batch_prefix
+                and os.environ.get("BLOOMBEE_EAGLE_VARLEN_BATCH", "1").strip().lower()
+                not in ("0", "false", "off", "no")
+                and len(prefix_lengths) == batch_size
+                and all(length > 0 for length in prefix_lengths)
+                and prefix_hidden_states.shape[1] >= max(prefix_lengths)
+            )
+            if varlen_prefix:
+                # Het batch: rows have different prefix lengths, so the uniform
+                # batched path rejects them and the old code fell back to a
+                # per-row build (~6x slower at b8). Instead: pad-merge the
+                # per-row prefix caches into ONE scattered-layout batch cache,
+                # run a single masked suffix forward, and expand all rows in one
+                # batched pass (native tensor tree when enabled, object trees
+                # otherwise). Mathematically identical conditioning (mask only
+                # hides padding); per-row position_ids keep RoPE exact.
+                try:
+                    max_prefix_len = max(prefix_lengths)
+                    shifted_ids_pad = input_ids[:, 1:max_prefix_len + 1].to(self.device)
+                    root_tokens_host = [
+                        (
+                            prev_last_token_host[b]
+                            if prev_last_token_host is not None
+                            else _root_tok_from_ids(b, prefix_lengths[b])
+                        )
+                        for b in range(batch_size)
+                    ]
+                    ctx = self._prefill_with_prefix_batch_varlen(
+                        prefix_hidden_states[:, :max_prefix_len, :],
+                        shifted_ids_pad,
+                        cache_keys=list(range(batch_size)),
+                        prefix_lens=prefix_lengths,
+                        root_tokens=root_tokens_host,
+                    )
+                    native_varlen = (
+                        _tensor_tree_emit_mode() == "1"
+                        and _tensor_tree_consumer_enabled()
+                        and not do_sample
+                    )
+                    if native_varlen:
+                        root_tokens_gpu = (
+                            prev_last_token.to(self.device).long()
+                            if prev_last_token is not None
+                            else None
+                        )
+                        native_tt = self._build_tensor_tree_batched(
+                            prefix_ctx=ctx,
+                            max_candidate_depth=max_candidate_depth,
+                            total_token=total_token,
+                            expansion_width=K_child,
+                            root_tokens_gpu=root_tokens_gpu,
+                        )
+                        self.last_tensor_tree = native_tt
+                        return None
+                    built_trees = self._build_trees_from_prefix_caches_batched(
+                        prefix_ctx=ctx,
+                        max_candidate_depth=max_candidate_depth,
+                        total_token=total_token,
+                        expansion_width=K_child,
+                    )
+                    if _tensor_tree_emit_mode() == "shadow":
+                        tt_native = self._build_tensor_tree_batched(
+                            prefix_ctx=ctx,
+                            max_candidate_depth=max_candidate_depth,
+                            total_token=total_token,
+                            expansion_width=K_child,
+                        )
+                        tt_bridge = tensor_tree_from_speculative_trees(built_trees, self.device)
+                        if not (
+                            tt_native.max_nodes == tt_bridge.max_nodes
+                            and torch.equal(tt_native.n_nodes, tt_bridge.n_nodes)
+                            and torch.equal(tt_native.token, tt_bridge.token)
+                            and torch.equal(tt_native.parent_idx, tt_bridge.parent_idx)
+                            and torch.equal(tt_native.depth, tt_bridge.depth)
+                        ):
+                            raise AssertionError("varlen shadow mismatch: native != object bridge")
+                        logger.info("[TENSOR_TREE_EMIT] varlen shadow OK: B=%d", batch_size)
+                    for b, tree in enumerate(built_trees):
+                        results[b] = tree
+                    batched_prefix_rows.update(range(batch_size))
+                except Exception as e:
+                    logger.debug(
+                        "[EAGLEDrafter] varlen batched prefix failed; falling back row-wise: %s",
                         e,
                         exc_info=True,
                     )

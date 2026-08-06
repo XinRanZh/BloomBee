@@ -208,12 +208,59 @@ def prepare_incremental_tree_batch(
     """
     Build an incremental tree batch supporting variable sequence lengths.
     """
-    batch_size = len(trees)
-
+    batch_tree_token_ids: List[List[int]] = []
+    batch_parent_indices: List[List[int]] = []
+    batch_node_paths = []
     if not trees or all(tree.total_nodes <= 1 for tree in trees):
-        return torch.empty(batch_size, 0, dtype=torch.long, device=device), None, [[] for _ in trees]
+        return torch.empty(len(trees), 0, dtype=torch.long, device=device), None, [[] for _ in trees]
+    for tree in trees:
+        linearized_nodes, parent_indices = linearize_tree_with_positions(tree)
+        batch_tree_token_ids.append([node.token_id for node in linearized_nodes])
+        batch_parent_indices.append(parent_indices)
+        # Leaf-path DFS is only consumed by the sampling verifier; skip it for
+        # greedy decode (return_node_paths=False) to avoid the recursive Python walk.
+        if return_node_paths:
+            batch_node_paths.append(tree.root.get_all_leaf_node_paths())
+        else:
+            batch_node_paths.append([])
 
-    max_tree_size = max(tree.total_nodes - 1 for tree in trees if tree.total_nodes > 1)
+    return _prepare_incremental_tree_batch_impl(
+        batch_tree_token_ids,
+        batch_parent_indices,
+        batch_node_paths,
+        input_ids,
+        device,
+        pad_token_id=pad_token_id,
+        seq_lengths=seq_lengths,
+        is_prefill=is_prefill,
+        kv_cache_position_ids=kv_cache_position_ids,
+        return_local_tree_mask=return_local_tree_mask,
+    )
+
+
+def _prepare_incremental_tree_batch_impl(
+    batch_tree_token_ids: List[List[int]],
+    batch_parent_indices: List[List[int]],
+    batch_node_paths: List,
+    input_ids: torch.LongTensor,
+    device: torch.device,
+    pad_token_id: int = 0,
+    seq_lengths: Optional[torch.LongTensor] = None,
+    is_prefill: bool = False,
+    kv_cache_position_ids: Optional[torch.Tensor] = None,  # (B, max_pos_len), -1 is padding
+    return_local_tree_mask: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, List]:
+    """Shared per-row token/mask assembly for `prepare_incremental_tree_batch`
+    (SpeculativeTree input) and `prepare_incremental_tensor_tree_batch`
+    (TensorTreeBatch input). `batch_tree_token_ids[b]` / `batch_parent_indices[b]`
+    are the row's DRAFT nodes in DFS pre-order (root excluded; parent -1 = root).
+    """
+    batch_size = len(batch_tree_token_ids)
+
+    if batch_size == 0 or all(len(toks) == 0 for toks in batch_tree_token_ids):
+        return torch.empty(batch_size, 0, dtype=torch.long, device=device), None, batch_node_paths
+
+    max_tree_size = max(len(toks) for toks in batch_tree_token_ids)
     
     # Generation phase: the server compacts the accepted sparse slots into a
     # contiguous prefix before running the next tree. The local mask must match
@@ -230,17 +277,16 @@ def prepare_incremental_tree_batch(
 
     batch_tree_tokens = []
     batch_attention_masks = []
-    batch_node_paths = []
+    out_node_paths = []
 
-    for i, tree in enumerate(trees):
+    for i in range(batch_size):
+        tree_token_ids = batch_tree_token_ids[i]
+        parent_indices = batch_parent_indices[i]
         if seq_lengths is not None:
             curr_seq_len = seq_lengths[i].item()
         else:
             curr_seq_len = input_ids.shape[1]
-        
-        linearized_nodes, parent_indices = linearize_tree_with_positions(tree)
 
-        tree_token_ids = [node.token_id for node in linearized_nodes]
         padded_tokens = tree_token_ids + [pad_token_id] * (max_tree_size - len(tree_token_ids))
         batch_tree_tokens.append(padded_tokens)
 
@@ -343,12 +389,7 @@ def prepare_incremental_tree_batch(
                 mask = padded_mask
 
         batch_attention_masks.append(mask)
-        # Leaf-path DFS is only consumed by the sampling verifier; skip it for
-        # greedy decode (return_node_paths=False) to avoid the recursive Python walk.
-        if return_node_paths:
-            batch_node_paths.append(tree.root.get_all_leaf_node_paths())
-        else:
-            batch_node_paths.append([])
+        out_node_paths.append(batch_node_paths[i] if i < len(batch_node_paths) else [])
 
     tree_tokens = torch.tensor(batch_tree_tokens, device=device)
 
@@ -357,7 +398,7 @@ def prepare_incremental_tree_batch(
     else:
         attention_mask = None
 
-    return tree_tokens, attention_mask, batch_node_paths
+    return tree_tokens, attention_mask, out_node_paths
 
 
 def _compute_single_cache_valid_mask(

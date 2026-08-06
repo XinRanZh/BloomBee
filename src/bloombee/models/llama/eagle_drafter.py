@@ -60,6 +60,11 @@ from transformers import AutoConfig
 from transformers.cache_utils import DynamicCache
 
 from bloombee.models.llama.spe_dec_tree import SpeculativeTree
+from bloombee.models.llama.tensor_tree import (
+    TensorTreeBatch,
+    tensor_tree_from_eagle_candidate_tensors,
+    tensor_tree_from_speculative_trees,
+)
 
 logger = get_logger()
 
@@ -99,6 +104,25 @@ def select_bandwidth_adaptive_budget(bandwidth_mbps: Optional[float], default_bu
     else:                            # ~E1/E2 (>=500 Mbps / LAN): accept-bound
         chosen = default_budget
     return max(1, min(int(chosen), int(default_budget)))
+
+
+# Native GPU-tree emit (GPU-tree migration, stage 2b/2c). Modes:
+#   "0"      (default) build _CandNode/TreeNode object graphs as before;
+#   "shadow" build object trees AND the native TensorTreeBatch, assert equality
+#            (validation runs — fail fast on divergence);
+#   "1"      skip the object graph for the batched prefix path and return a
+#            TensorTreeBatch via `EAGLEDrafter.last_tensor_tree` (requires
+#            BLOOMBEE_TENSOR_TREE=1 so the model side consumes it, greedy only).
+_TENSOR_TREE_EMIT_ENV = "BLOOMBEE_TENSOR_TREE_EMIT"
+_TENSOR_TREE_CONSUMER_ENV = "BLOOMBEE_TENSOR_TREE"
+
+
+def _tensor_tree_emit_mode() -> str:
+    return os.environ.get(_TENSOR_TREE_EMIT_ENV, "0").strip().lower()
+
+
+def _tensor_tree_consumer_enabled() -> bool:
+    return os.environ.get(_TENSOR_TREE_CONSUMER_ENV, "0").strip().lower() in ("1", "true", "on", "yes")
 
 _EAGLE_DRAFTER_REGISTRY: Dict[str, Dict[int, str]] = {
     # Official yuhuili EAGLE/EAGLE-2-compatible head checkpoints. Keep this
@@ -1264,6 +1288,237 @@ class EAGLEDrafter:
         return trees
 
     @torch.no_grad()
+    def _build_tensor_tree_batched(
+        self,
+        *,
+        jobs: Sequence[_PrefixBuildJob],
+        max_candidate_depth: int,
+        total_token: int,
+        expansion_width: int,
+        pad_token_id: int = 0,
+        root_tokens_gpu: Optional[torch.Tensor] = None,
+    ) -> TensorTreeBatch:
+        """Native GPU-tree variant of `_build_trees_from_prefix_caches_batched`.
+
+        Runs the SAME batched EAGLE-2 expansion (same `_step`/`_logits`/
+        `_topk_logprobs` calls with bit-identical inputs) but keeps candidates in
+        fixed `[B, C]` device tensors end-to-end: no `_CandNode` allocation, no
+        per-depth `.tolist()` host syncs, no Python top-m sort / parent closure /
+        TreeNode binding. The candidate block layout matches the object path's
+        append order exactly (slot == per-row creation_index):
+
+          * slots ``0..seed_count-1``: depth-1 seeds in top-k rank order;
+          * each expansion depth appends one block of ``frontier * child_count``
+            children in ``(frontier position, top-k rank)`` order.
+
+        Score semantics are preserved bit-for-bit: fp64 `cand_path_logp64`
+        accumulates fp32 top-k values exactly like the Python `float` sums, and
+        the next-frontier selection uses the same fp32 `cumulative` rule
+        (`top_values + path_log_p cast to fp32`) fed to the same `torch.topk`.
+        Selection/closure/DFS-ordering then run in
+        `tensor_tree_from_eagle_candidate_tensors`, which is validated
+        bit-identical to `_topm_global` + `_close_under_parents` +
+        `_bind_into_speculative_tree` + DFS (scripts/test_native_tensor_tree.py).
+        """
+        if len(jobs) < 2:
+            raise ValueError("Native tensor-tree emit is only defined for batched jobs")
+
+        prefix_next_pos = int(jobs[0].prefix_next_pos)
+        if any(int(job.prefix_next_pos) != prefix_next_pos for job in jobs):
+            raise ValueError("Batched EAGLE tree expansion requires same-length prefix caches")
+
+        batch_size = len(jobs)
+        K = max(1, int(expansion_width))
+        device = self.device
+        root_hiddens = torch.stack(
+            [job.root_hidden.to(device=device, dtype=self.dtype) for job in jobs],
+            dim=0,
+        )
+        root_tokens = [int(job.root_token) for job in jobs]
+        # Prefer a device-resident root token tensor: `torch.tensor(list,
+        # device=cuda)` issues a synchronous pageable H2D copy that stalls the
+        # stream (measured ~ms-scale on multi-GPU hosts); a GPU-side gather is free.
+        if root_tokens_gpu is None:
+            root_tokens_t = torch.tensor(root_tokens, dtype=torch.long, device=device)
+        else:
+            root_tokens_t = root_tokens_gpu.to(device=device, dtype=torch.long)
+        work_cache = self._merge_prefix_caches_batch([job.prefix_cache for job in jobs])
+
+        logits0 = self._logits(root_hiddens)
+        top0 = self._topk_logprobs(logits0, k=K)
+        seed_count = int(top0.indices.shape[-1])
+
+        if seed_count == 0:
+            token = root_tokens_t.unsqueeze(1)
+            return TensorTreeBatch(
+                token=token,
+                parent_idx=torch.full((batch_size, 1), -1, dtype=torch.long, device=device),
+                depth=torch.zeros(batch_size, 1, dtype=torch.long, device=device),
+                n_nodes=torch.ones(batch_size, dtype=torch.long, device=device),
+                device=device,
+                max_nodes=1,
+            )
+
+        # Candidate arena: seeds + one frontier*K block per expansion depth.
+        c_max = seed_count + max(0, int(max_candidate_depth) - 1) * K * K
+        cand_token = torch.zeros(batch_size, c_max, dtype=torch.long, device=device)
+        cand_parent = torch.full((batch_size, c_max), -1, dtype=torch.long, device=device)
+        cand_depth = torch.zeros(batch_size, c_max, dtype=torch.long, device=device)
+        cand_path64 = torch.zeros(batch_size, c_max, dtype=torch.float64, device=device)
+        cand_valid = torch.zeros(batch_size, c_max, dtype=torch.bool, device=device)
+
+        cand_token[:, :seed_count] = top0.indices
+        cand_path64[:, :seed_count] = top0.values.to(torch.float64)
+        cand_depth[:, :seed_count] = 1
+        cand_valid[:, :seed_count] = True
+
+        # Frontier state (all device-resident for the whole expansion).
+        frontier_cand_idx = (
+            torch.arange(seed_count, device=device).unsqueeze(0).expand(batch_size, -1)
+        )
+        frontier_token = top0.indices                                   # [B, F]
+        frontier_path64 = top0.values.to(torch.float64)                 # [B, F]
+        frontier_parent_hidden = (
+            root_hiddens.unsqueeze(1).expand(batch_size, seed_count, root_hiddens.shape[-1]).contiguous()
+        )
+
+        tree_mask = (
+            torch.eye(seed_count, dtype=torch.bool, device=device)
+            .unsqueeze(0)
+            .expand(batch_size, -1, -1)
+            .clone()
+        )
+
+        offset = seed_count
+        try:
+            for depth in range(1, max_candidate_depth):
+                frontier_size = int(frontier_token.shape[1])
+                if frontier_size == 0:
+                    break
+
+                position_ids = torch.full(
+                    (batch_size, frontier_size),
+                    int(prefix_next_pos + depth - 1),
+                    device=device,
+                    dtype=torch.long,
+                )
+                attn_mask = self._tree_attention_mask(tree_mask, int(prefix_next_pos), self.dtype)
+                out_hidden, work_cache = self._step(
+                    hidden_states=frontier_parent_hidden,
+                    input_ids=frontier_token,
+                    position_ids=position_ids,
+                    past_key_values=work_cache,
+                    attention_mask=attn_mask,
+                )
+                layer_hidden = out_hidden.detach()
+                seed_logits = self._logits(layer_hidden.reshape(batch_size * frontier_size, -1))
+                top_k = self._topk_logprobs(seed_logits, k=K)
+                top_values = top_k.values.view(batch_size, frontier_size, -1)
+                top_indices = top_k.indices.view(batch_size, frontier_size, -1)
+                child_count = int(top_indices.shape[-1])
+                n_child = frontier_size * child_count
+
+                # Append this depth's children block (creation order preserved).
+                sl = slice(offset, offset + n_child)
+                cand_token[:, sl] = top_indices.reshape(batch_size, n_child)
+                cand_parent[:, sl] = (
+                    frontier_cand_idx.unsqueeze(2)
+                    .expand(batch_size, frontier_size, child_count)
+                    .reshape(batch_size, n_child)
+                )
+                cand_depth[:, sl] = depth + 1
+                cand_path64[:, sl] = (
+                    frontier_path64.unsqueeze(2) + top_values.to(torch.float64)
+                ).reshape(batch_size, n_child)
+                cand_valid[:, sl] = True
+
+                # Next frontier: same fp32 cumulative rule as the object path
+                # (fp64 path log-prob cast down to the top-k value dtype).
+                cumulative = top_values + frontier_path64.to(top_values.dtype).unsqueeze(2)
+                next_count = min(K, n_child)
+                if next_count <= 0:
+                    break
+                top_next = torch.topk(cumulative.reshape(batch_size, -1), k=next_count, dim=-1)
+                parent_indices = torch.div(top_next.indices, child_count, rounding_mode="floor")
+
+                flat_slots = offset + top_next.indices                  # [B, next_count]
+                frontier_cand_idx = flat_slots
+                frontier_token = cand_token.gather(1, flat_slots)
+                frontier_path64 = cand_path64.gather(1, flat_slots)
+                frontier_parent_hidden = layer_hidden.gather(
+                    1,
+                    parent_indices.unsqueeze(-1).expand(batch_size, next_count, layer_hidden.shape[-1]),
+                )
+
+                row_ids = torch.arange(batch_size, device=device)[:, None]
+                selected_parent_mask = tree_mask[row_ids, parent_indices]
+                child_eye = (
+                    torch.eye(next_count, dtype=torch.bool, device=device)
+                    .unsqueeze(0)
+                    .expand(batch_size, -1, -1)
+                )
+                tree_mask = torch.cat((selected_parent_mask, child_eye), dim=2)
+                offset += n_child
+        finally:
+            if hasattr(work_cache, "crop"):
+                work_cache.crop(int(prefix_next_pos))
+
+        return tensor_tree_from_eagle_candidate_tensors(
+            root_tokens=root_tokens_t,
+            cand_token=cand_token,
+            cand_parent_cidx=cand_parent,
+            cand_depth=cand_depth,
+            cand_path_logp64=cand_path64,
+            cand_valid=cand_valid,
+            total_token=total_token,
+            max_candidate_depth=max_candidate_depth,
+            pad_token_id=pad_token_id,
+        )
+
+    @torch.no_grad()
+    def _shadow_compare_tensor_tree(
+        self,
+        *,
+        jobs: Sequence[_PrefixBuildJob],
+        built_trees: List[SpeculativeTree],
+        max_candidate_depth: int,
+        total_token: int,
+        expansion_width: int,
+    ) -> None:
+        """BLOOMBEE_TENSOR_TREE_EMIT=shadow: build the native TensorTreeBatch for
+        the same jobs and assert it is bit-identical to the object trees' bridge.
+        Validation-only (runs the expansion a second time); raises on divergence.
+        """
+        tt_native = self._build_tensor_tree_batched(
+            jobs=jobs,
+            max_candidate_depth=max_candidate_depth,
+            total_token=total_token,
+            expansion_width=expansion_width,
+        )
+        tt_bridge = tensor_tree_from_speculative_trees(built_trees, self.device)
+        ok = (
+            tt_native.max_nodes == tt_bridge.max_nodes
+            and tt_native.batch_size == tt_bridge.batch_size
+            and torch.equal(tt_native.n_nodes, tt_bridge.n_nodes)
+            and torch.equal(tt_native.token, tt_bridge.token)
+            and torch.equal(tt_native.parent_idx, tt_bridge.parent_idx)
+            and torch.equal(tt_native.depth, tt_bridge.depth)
+        )
+        if not ok:
+            raise AssertionError(
+                "BLOOMBEE_TENSOR_TREE_EMIT=shadow mismatch: "
+                f"native n_nodes={tt_native.n_nodes.tolist()} "
+                f"bridge n_nodes={tt_bridge.n_nodes.tolist()} "
+                f"native max_nodes={tt_native.max_nodes} bridge max_nodes={tt_bridge.max_nodes}\n"
+                f"native token={tt_native.token.tolist()}\nbridge token={tt_bridge.token.tolist()}\n"
+                f"native parent={tt_native.parent_idx.tolist()}\nbridge parent={tt_bridge.parent_idx.tolist()}"
+            )
+        logger.info(
+            "[TENSOR_TREE_EMIT] shadow OK: B=%d max_nodes=%d",
+            tt_native.batch_size, tt_native.max_nodes,
+        )
+
+    @torch.no_grad()
     def _build_tree_from_prefix_cache(
         self,
         *,
@@ -1486,7 +1741,13 @@ class EAGLEDrafter:
             ``beam_width`` and ``max_depth`` so ``depth=5,width=1`` verifies
             five draft nodes, not EAGLE's paper-sized 60-node tree.
           ``topk_per_step`` int: per-layer top-k expansion count.
+
+        Returns ``List[SpeculativeTree]`` — or ``None`` when the native GPU-tree
+        emit handled the whole batch (BLOOMBEE_TENSOR_TREE=1 +
+        BLOOMBEE_TENSOR_TREE_EMIT=1, greedy, single uniform batched prefix
+        expansion); in that case the result is in ``self.last_tensor_tree``.
         """
+        self.last_tensor_tree: Optional[TensorTreeBatch] = None
         if (
             prefix_hidden_states is None
             and (prev_last_hidden is None or prev_last_token is None)
@@ -1495,9 +1756,12 @@ class EAGLEDrafter:
             # an empty tree; caller will detect zero tree_tokens and use the
             # AR fallback path. This keeps the very first decode step safe.
             B = int(input_ids.shape[0])
+            # Batched host transfer: one sync total instead of 2*B per-row .item()s.
+            seq_host = seq_lengths.tolist()
+            ids_host = input_ids.tolist()
             out: List[SpeculativeTree] = []
             for b in range(B):
-                root = int(input_ids[b, max(0, int(seq_lengths[b].item()) - 1)].item())
+                root = int(ids_host[b][max(0, int(seq_host[b]) - 1)])
                 out.append(SpeculativeTree(root, request_id=f"eagle2_warmup_{b}"))
             return out
 
@@ -1548,11 +1812,26 @@ class EAGLEDrafter:
             if cache_key >= batch_size:
                 del self._prefix_states[cache_key]
 
+        # One batched host transfer for all per-row scalars used below. The old
+        # per-row `.item()` reads cost a CUDA sync each (3*B+ per build), which
+        # dominates the CPU cost of a draft round on multi-GPU hosts.
+        seq_lengths_host = [int(x) for x in seq_lengths.tolist()]
+        prev_last_token_host = (
+            [int(x) for x in prev_last_token.tolist()] if prev_last_token is not None else None
+        )
+        input_ids_host: Optional[List[List[int]]] = None
+
+        def _root_tok_from_ids(b: int, root_pos: int) -> int:
+            nonlocal input_ids_host
+            if input_ids_host is None:
+                input_ids_host = input_ids.tolist()
+            return int(input_ids_host[b][root_pos])
+
         results: List[Optional[SpeculativeTree]] = [None] * batch_size
         prefix_jobs: List[_PrefixBuildJob] = []
         batched_prefix_rows: set[int] = set()
         if prefix_hidden_states is not None and batch_size > 1:
-            prefix_lengths = [max(0, int(seq_lengths[b].item()) - 1) for b in range(batch_size)]
+            prefix_lengths = [max(0, seq_lengths_host[b] - 1) for b in range(batch_size)]
             common_prefix_len = prefix_lengths[0] if prefix_lengths else 0
             can_batch_prefix = (
                 common_prefix_len > 0
@@ -1568,11 +1847,11 @@ class EAGLEDrafter:
                         cache_keys=list(range(batch_size)),
                     )
                     for b, (prefix_root_hidden, prefix_cache, prefix_next_pos) in enumerate(prefix_prefills):
-                        root_pos = int(seq_lengths[b].item()) - 1
+                        root_pos = seq_lengths_host[b] - 1
                         root_tok = (
-                            int(prev_last_token[b].item())
-                            if prev_last_token is not None
-                            else int(input_ids[b, root_pos].item())
+                            prev_last_token_host[b]
+                            if prev_last_token_host is not None
+                            else _root_tok_from_ids(b, root_pos)
                         )
                         prefix_jobs.append(
                             _PrefixBuildJob(
@@ -1594,12 +1873,12 @@ class EAGLEDrafter:
         for b in range(batch_size):
             if b in batched_prefix_rows:
                 continue
-            root_pos = int(seq_lengths[b].item()) - 1
+            root_pos = seq_lengths_host[b] - 1
             base_pos = max(0, root_pos - 1)
-            if prev_last_token is not None:
-                root_tok = int(prev_last_token[b].item())
+            if prev_last_token_host is not None:
+                root_tok = prev_last_token_host[b]
             else:
-                root_tok = int(input_ids[b, root_pos].item())
+                root_tok = _root_tok_from_ids(b, root_pos)
 
             prefix_len = root_pos
             use_prefix = (
@@ -1730,6 +2009,47 @@ class EAGLEDrafter:
             for job in prefix_jobs:
                 jobs_by_prefix_len.setdefault(int(job.prefix_next_pos), []).append(job)
 
+            # Native GPU-tree emit (stage 2c): when the WHOLE batch expands as a
+            # single batched prefix call (the steady-state hot path), skip the
+            # _CandNode/TreeNode object graph entirely and hand back a
+            # TensorTreeBatch via self.last_tensor_tree. Requires the consumer
+            # side (BLOOMBEE_TENSOR_TREE=1) and greedy decode; any deviation
+            # falls back to the object path. Partial coverage (row-wise jobs,
+            # mixed prefix lengths, batch=1) is deliberately NOT native — the
+            # caller can only consume one tree representation per round.
+            if (
+                _tensor_tree_emit_mode() == "1"
+                and _tensor_tree_consumer_enabled()
+                and not do_sample
+                and batch_size > 1
+                and len(jobs_by_prefix_len) == 1
+                and len(prefix_jobs) == batch_size
+            ):
+                jobs = next(iter(jobs_by_prefix_len.values()))
+                # Device-resident root tokens (avoid a synchronous list→GPU copy
+                # in the hot path); round ≥ 2 always has prev_last_token.
+                root_tokens_gpu = None
+                if prev_last_token is not None:
+                    root_tokens_gpu = prev_last_token.to(self.device).long()
+                native_tt: Optional[TensorTreeBatch] = None
+                try:
+                    native_tt = self._build_tensor_tree_batched(
+                        jobs=jobs,
+                        max_candidate_depth=max_candidate_depth,
+                        total_token=total_token,
+                        expansion_width=K_child,
+                        root_tokens_gpu=root_tokens_gpu,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "[EAGLEDrafter] native tensor-tree emit failed; falling back to object path: %s",
+                        e,
+                        exc_info=True,
+                    )
+                if native_tt is not None:
+                    self.last_tensor_tree = native_tt
+                    return None
+
             for jobs in jobs_by_prefix_len.values():
                 try:
                     built_trees = self._build_trees_from_prefix_caches_batched(
@@ -1756,6 +2076,17 @@ class EAGLEDrafter:
                         )
                         for job in jobs
                     ]
+
+                if _tensor_tree_emit_mode() == "shadow" and len(jobs) > 1:
+                    # Validation: native TensorTreeBatch must equal the object
+                    # trees' bridge bit-for-bit. Raises on divergence.
+                    self._shadow_compare_tensor_tree(
+                        jobs=jobs,
+                        built_trees=built_trees,
+                        max_candidate_depth=max_candidate_depth,
+                        total_token=total_token,
+                        expansion_width=K_child,
+                    )
 
                 for job, tree in zip(jobs, built_trees):
                     results[job.batch_index] = tree

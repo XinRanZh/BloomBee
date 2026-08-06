@@ -1,9 +1,24 @@
-"""Tensorized EAGLE-2 speculative tree (GPU-tree migration, Stage 1+2).
+"""Tensorized EAGLE-2 speculative tree (GPU-tree migration, Stage 1+2+3).
 
 This module replaces the per-round Python `_CandNode`/`TreeNode` object graph,
 the Python global rerank / parent-closure, the recursive DFS linearization, the
 per-row attention-mask build, and the Python child-walk in greedy verification
 with fixed `[B, max_nodes]` tensors and vectorized GPU ops.
+
+Pipeline (all flag-gated; Python paths remain as reference/fallback):
+
+* Stage 1 (`BLOOMBEE_TENSOR_TREE=1`): `greedy_verify_tensorized` — sync-free
+  GPU accept walk (fixed step count = tree depth, no per-depth host syncs,
+  vectorized output assembly; one host sync total).
+* Stage 2a-c (`BLOOMBEE_TENSOR_TREE_EMIT=shadow|1`):
+  `EAGLEDrafter._build_tensor_tree_batched` keeps expansion candidates in
+  `[B, C]` device tensors end-to-end (no `_CandNode` churn, no per-depth
+  `.tolist()`) and `tensor_tree_from_eagle_candidate_tensors` reproduces the
+  Python `_topm_global` + `_close_under_parents` + `_bind` + DFS-preorder
+  pipeline bit-for-bit (no boolean-mask indexing — `aten::nonzero` syncs).
+* Stage 3: `prepare_incremental_tensor_tree_batch` + `local_tree_mask_from_tensor_tree`
+  build the vLLM-style local tree mask on-device via a depth-bounded pointer
+  walk (no per-row Python `while` over parent indices).
 
 HARD CONTRACT (must stay token-identical to the Python path for greedy decode):
 
@@ -19,8 +34,10 @@ HARD CONTRACT (must stay token-identical to the Python path for greedy decode):
   index) whose token equals the target argmax — identical to the Python
   ``for child in parent.children: if child.token_id == predicted: break``.
 
-The module is consumed behind ``BLOOMBEE_TENSOR_TREE=1`` with the Python path
-kept as the reference/fallback.
+Validated by: scripts/test_native_tensor_tree.py (selection/DFS identity),
+scripts/test_tensor_greedy_identity.py + _randomized.py (verifier identity),
+scripts/test_tensor_prepare_identity.py (mask byte-identity),
+tests/test_eagle_native_emit.py (drafter wiring + shadow mode).
 """
 
 from __future__ import annotations
@@ -42,6 +59,9 @@ class TensorTreeBatch:
 
     Index 0 is the root. Draft nodes are 1..n_nodes[b]-1 in DFS pre-order.
     Padding slots (>= n_nodes[b]) are token=pad, parent_idx=-1, alive=False.
+
+    ``max_depth_host`` is a host-side upper bound on the tree depth (no sync):
+    the accept walk never needs more than this many steps.
     """
 
     token: torch.Tensor          # [B, N] long  (node 0 = root token)
@@ -50,6 +70,7 @@ class TensorTreeBatch:
     n_nodes: torch.Tensor        # [B] long     valid node count incl. root
     device: torch.device
     max_nodes: int               # N (incl. root slot)
+    max_depth_host: int = 0      # host-side upper bound on max node depth (0 = unknown)
 
     @property
     def batch_size(self) -> int:
@@ -106,6 +127,7 @@ def tensor_tree_from_speculative_trees(
 
     max_nodes = max((len(t) for t in rows_tokens), default=1)
     max_nodes = max(max_nodes, 1)
+    max_depth_host = max((max(d) for d in rows_depth if d), default=0)
     token = torch.full((batch_size, max_nodes), pad_token_id, dtype=torch.long, device=device)
     parent_idx = torch.full((batch_size, max_nodes), -1, dtype=torch.long, device=device)
     depth = torch.zeros((batch_size, max_nodes), dtype=torch.long, device=device)
@@ -117,7 +139,8 @@ def tensor_tree_from_speculative_trees(
         depth[b, :n] = torch.tensor(rows_depth[b], dtype=torch.long, device=device)
         n_nodes[b] = n
     return TensorTreeBatch(token=token, parent_idx=parent_idx, depth=depth,
-                           n_nodes=n_nodes, device=device, max_nodes=max_nodes)
+                           n_nodes=n_nodes, device=device, max_nodes=max_nodes,
+                           max_depth_host=max_depth_host)
 
 
 @torch.no_grad()
@@ -133,7 +156,15 @@ def greedy_verify_tensorized(
     input_ids: Optional[torch.Tensor] = None,  # [B, *] for logits_processor
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """GPU greedy tree verification. Token-identical to
-    ``_extract_greedy_verified_paths_from_hidden`` but with no per-depth host sync.
+    ``_extract_greedy_verified_paths_from_hidden``.
+
+    The accept walk runs a FIXED ``tree_len + 1`` steps with no per-depth host
+    sync: a row that misses a match (or falls out of the hidden window) masks
+    itself out permanently, so extra steps are no-ops for it. Projecting the
+    lm-head for those dead rows costs one small [B,H]@[H,V] GEMM per step —
+    far cheaper than the per-step CUDA syncs + pipeline stalls they replace
+    (the old version synced twice per accepted depth). Exactly one host sync
+    remains: ``accept_count.max()`` to size the ragged outputs.
 
     Returns (verified_tokens[B,Lmax] or None, kv_cache_position_ids[B,Lmax+1],
     llm_generated_tokens[B,1], valid_lengths[B], final_positions[B])."""
@@ -142,11 +173,11 @@ def greedy_verify_tensorized(
     B = int(hidden_states.shape[0])
     S = int(hidden_states.shape[1])
     N = tt.max_nodes
-    token = tt.token
-    parent_idx = tt.parent_idx
-    n_nodes = tt.n_nodes
+    token = tt.token.to(device_h)
+    parent_idx = tt.parent_idx.to(device_h)
+    n_nodes = tt.n_nodes.to(device_h)
     node_ar = torch.arange(N, device=device_h).unsqueeze(0)          # [1, N]
-    alive = node_ar < n_nodes.to(device_h).unsqueeze(1)              # [B, N] valid node slots
+    alive = node_ar < n_nodes.unsqueeze(1)                           # [B, N] valid node slots
     # tree_root_positions[b] = seq_lengths[b]-1 (absolute position of the root/last committed tok)
     seq_h = seq_lengths.to(device_h).long()
     tree_root_positions = seq_h - 1
@@ -155,16 +186,21 @@ def greedy_verify_tensorized(
     # A row is active iff its current parent (active_node) has at least one live child.
     def children_exist(node_b):  # node_b: [B] -> [B] bool
         return ((parent_idx == node_b.unsqueeze(1)) & alive).any(dim=1)
-    active = children_exist(active_node) & (n_nodes.to(device_h) > 1)
+    active = children_exist(active_node) & (n_nodes > 1)
 
+    # The accept walk descends exactly one tree depth per step, so a host-known
+    # depth bound caps the loop (default EAGLE 10-3 tree: 6 steps instead of
+    # tree_len+1 = 11). Extra steps are no-ops; fewer would lose accepts.
+    depth_bound = int(getattr(tt, "max_depth_host", 0) or 0)
     max_steps = max(int(tree_len), 0) + 1
+    if depth_bound > 0:
+        max_steps = min(max_steps, depth_bound)
     accepted_tokens_steps: List[torch.Tensor] = []   # each [B]
     accepted_nodes_steps: List[torch.Tensor] = []     # each [B] node idx (or -1)
     accept_count = torch.zeros(B, dtype=torch.long, device=device_h)
+    bidx = torch.arange(B, device=device_h)
 
     for _step in range(max_steps):
-        if not bool(active.any()):
-            break
         # Parent logits position per row (mirror _tree_parent_logits_position).
         is_root = active_node == 0
         pos_first = torch.where(is_root, seq_h - 1, seq_h + (active_node - 1))
@@ -172,12 +208,7 @@ def greedy_verify_tensorized(
         pos = pos_first if is_first_iteration else pos_rest
         in_window = (pos >= 0) & (pos < S)
         cur = active & in_window
-        # Rows that are active but out-of-window go inactive (Python warns+drops).
-        active = active & in_window
-        if not bool(cur.any()):
-            break
         pos_clamped = pos.clamp(0, max(S - 1, 0))
-        bidx = torch.arange(B, device=device_h)
         parent_hidden = hidden_states[bidx, pos_clamped, :]            # [B, H]
         logits = project_rows(parent_hidden)                          # [B, vocab]
         predicted = logits.argmax(dim=-1)                             # [B]
@@ -193,69 +224,59 @@ def greedy_verify_tensorized(
         matched_idx = torch.where(matched, matched_idx, torch.full_like(matched_idx, -1))
         # Record accepted token/node for matched rows; -1 elsewhere this step.
         step_tok = torch.where(matched, token[bidx, matched_idx.clamp(min=0)], torch.full((B,), -1, device=device_h, dtype=torch.long))
-        step_tok = torch.where(matched, step_tok, torch.full_like(step_tok, -1))
         accepted_tokens_steps.append(step_tok)
-        accepted_nodes_steps.append(torch.where(matched, matched_idx, torch.full_like(matched_idx, -1)))
+        accepted_nodes_steps.append(matched_idx)
         accept_count = accept_count + matched.long()
         # Advance: matched rows move to matched_idx; others go inactive.
         active_node = torch.where(matched, matched_idx.clamp(min=0), active_node)
         active = matched & children_exist(active_node)
 
-    # Assemble per-row accepted token / position lists (now one host sync).
+    # ---- Output assembly, vectorized. A row's accepted steps are a contiguous
+    # PREFIX of its step list (once unmatched it can never match again), so the
+    # old per-row Python compaction is exactly a prefix slice. ----
     if accepted_tokens_steps:
-        toks_mat = torch.stack(accepted_tokens_steps, dim=1)   # [B, steps]
-        nodes_mat = torch.stack(accepted_nodes_steps, dim=1)   # [B, steps]
+        toks_mat = torch.stack(accepted_tokens_steps, dim=1)   # [B, max_steps]
+        nodes_mat = torch.stack(accepted_nodes_steps, dim=1)   # [B, max_steps]
     else:
         toks_mat = torch.empty(B, 0, dtype=torch.long, device=device_h)
         nodes_mat = torch.empty(B, 0, dtype=torch.long, device=device_h)
 
     valid_lengths = accept_count.to(out_device)
+    # The single host sync of the verifier: ragged output width.
     Lmax = int(accept_count.max().item()) if accept_count.numel() else 0
 
-    # Compact accepted tokens (drop -1 padding per row, preserving order).
     verified_tokens: Optional[torch.Tensor] = None
-    kv_root = tree_root_positions.to(out_device)
     if Lmax > 0:
-        verified_tokens = torch.full((B, Lmax), -1, dtype=torch.long, device=out_device)
+        verified_tokens = toks_mat[:, :Lmax].to(out_device)
     # absolute kv positions: root_pos[b] + matched_node_idx (since pos_in_seq = idx-1, +1 -> idx)
-    kv_positions_rows: List[torch.Tensor] = []
-    toks_cpu = toks_mat.tolist()
-    nodes_cpu = nodes_mat.tolist()
-    rootpos_cpu = tree_root_positions.tolist()
-    for b in range(B):
-        row_tok = [t for t in toks_cpu[b] if t >= 0]
-        row_nodes = [nd for nd in nodes_cpu[b] if nd >= 0]
-        if verified_tokens is not None and row_tok:
-            verified_tokens[b, :len(row_tok)] = torch.tensor(row_tok, dtype=torch.long, device=out_device)
-        abs_positions = [int(rootpos_cpu[b])] + [int(rootpos_cpu[b]) + int(nd) for nd in row_nodes]
-        kv_positions_rows.append(torch.tensor(abs_positions, dtype=torch.long, device=out_device))
+    kv_root = tree_root_positions.unsqueeze(1)                       # [B, 1]
+    kv_nodes = torch.where(
+        nodes_mat >= 0,
+        kv_root + nodes_mat.clamp(min=0),
+        torch.full_like(nodes_mat, -1),
+    )
+    kv_cache_position_ids = torch.cat([kv_root, kv_nodes], dim=1)[:, : Lmax + 1].to(out_device)
 
-    max_pos_len = max((p.shape[0] for p in kv_positions_rows), default=1)
-    kv_cache_position_ids = torch.full((B, max_pos_len), -1, dtype=torch.long, device=out_device)
-    for b, p in enumerate(kv_positions_rows):
-        kv_cache_position_ids[b, :p.shape[0]] = p
-
-    # Final / bonus-token position (mirror Python lines 1024-1046).
+    # Final / bonus-token position (mirror the Python path):
+    #   accept>0 : pos = last_node (relative), or root_pos + last_node on iter 1
+    #   accept=0 : pos = seq_len - 1 (iter 1) or (S - tree_len) - 1 (later iters)
+    # clamped to the hidden window. Rows with accept==0 gather a dummy slot from
+    # nodes_mat and take the no-accept branch, matching row_last_node's 0 default.
+    if nodes_mat.shape[1] > 0:
+        last_node = nodes_mat.gather(1, (accept_count - 1).clamp(min=0).unsqueeze(1)).squeeze(1)
+    else:
+        last_node = torch.zeros(B, dtype=torch.long, device=device_h)
+    abs_last = tree_root_positions + last_node
     fallback_pos = max(0, S - int(tree_len))
-    final_pos_index: List[int] = []
-    accept_cpu = accept_count.tolist()
-    seq_cpu = seq_h.tolist()
-    for b in range(B):
-        if accept_cpu[b] > 0:
-            # last accepted absolute position, mapped back into the hidden window
-            last_node = row_last_node(nodes_cpu[b])
-            abs_last = int(rootpos_cpu[b]) + int(last_node)
-            pos = abs_last - int(rootpos_cpu[b])   # = last_node (relative)
-            if is_first_iteration:
-                pos = abs_last
-        else:
-            real_fallback = int(seq_cpu[b]) if is_first_iteration else fallback_pos
-            pos = real_fallback - 1
-        pos = min(max(int(pos), 0), max(S - 1, 0))
-        final_pos_index.append(pos)
+    if is_first_iteration:
+        pos_accept = abs_last
+        pos_noaccept = seq_h - 1
+    else:
+        pos_accept = last_node
+        pos_noaccept = torch.full_like(seq_h, fallback_pos - 1)
+    fpi = torch.where(accept_count > 0, pos_accept, pos_noaccept)
+    fpi = fpi.clamp(0, max(S - 1, 0))
 
-    fpi = torch.tensor(final_pos_index, dtype=torch.long, device=device_h)
-    bidx = torch.arange(B, device=device_h)
     final_hidden = hidden_states[bidx, fpi, :]
     final_logits = project_rows(final_hidden)
     if logits_processor and len(logits_processor) > 0 and input_ids is not None:
@@ -271,15 +292,6 @@ def greedy_verify_tensorized(
 
     final_positions = fpi.to(out_device)
     return verified_tokens, kv_cache_position_ids, llm_generated_tokens, valid_lengths, final_positions
-
-
-def row_last_node(node_steps: List[int]) -> int:
-    """Last accepted node index in a per-row step list (ignores -1)."""
-    last = 0
-    for nd in node_steps:
-        if nd >= 0:
-            last = nd
-    return last
 
 
 @torch.no_grad()
@@ -309,7 +321,6 @@ def tensor_tree_from_eagle_candidate_tensors(
     device = cand_token.device
     B, C = cand_token.shape
     m = max(0, int(total_token) - 1)
-    NEG_INF = torch.tensor(float("-inf"), dtype=torch.float64, device=device)
 
     # --- 1. top-m selection by (-path_logp64, depth, slot), stable, valid only ---
     slot = torch.arange(C, device=device).unsqueeze(0).expand(B, C)  # [B,C] creation_index
@@ -345,54 +356,55 @@ def tensor_tree_from_eagle_candidate_tensors(
     selected = selected & cand_valid
 
     # --- 2. parent closure: add ancestors of selected (depth-bounded) ---
+    # Fixed iteration count, no early-exit host syncs: a depth-d candidate has at
+    # most d-1 candidate ancestors, so D+1 hops always converges and extra hops
+    # are idempotent no-ops.
     closed = selected.clone()
     for _ in range(int(max_candidate_depth) + 1):
         # parent slot of each closed candidate (>=0 means parent is a candidate)
-        par = cand_parent_cidx.clone()
+        par = cand_parent_cidx
         has_par = (par >= 0) & closed
-        if not bool(has_par.any()):
-            break
         par_safe = par.clamp(min=0)
         add = torch.zeros(B, C, dtype=torch.bool, device=device)
         add.scatter_(1, par_safe, has_par)  # mark parents of closed nodes
-        new_closed = closed | (add & cand_valid)
-        if bool((new_closed == closed).all()):
-            break
-        closed = new_closed
+        closed = closed | (add & cand_valid)
 
     # --- 3. final DFS pre-order via path-key lexsort ---
     # path_key[b,c] = [slot at depth1 ancestor, slot at depth2 ancestor, ..., own slot]
     # padded with -1 suffix so a parent sorts before its descendants.
     D = int(max_candidate_depth)
-    path_key = torch.full((B, C, D), -1, dtype=torch.long, device=device)
+    # Boolean-mask indexing (`t[mask]`) dispatches aten::nonzero, which forces a
+    # CUDA sync PER CALL (~0.5ms each on multi-GPU hosts — this loop used to cost
+    # ~24 syncs/build). Column D is a dumpster for writes from invalid chains:
+    # everything lands via scatter_, and the dumpster is sliced away at the end.
+    path_key = torch.full((B, C, D + 1), -1, dtype=torch.long, device=device)
     # walk ancestors: level 0 = own slot at position depth-1; fill from the node up.
     cur = slot.clone()                       # [B,C] current ancestor slot (start: self)
     cur_depth = cand_depth.clamp(min=0)      # [B,C]
     # For each node, its own slot goes at column (depth-1); ancestors fill earlier cols.
     for _level in range(D):
-        col = (cur_depth - 1).clamp(min=0, max=D - 1)  # [B,C]
         valid_cur = cur >= 0
-        # scatter cur into path_key[:, :, col] per node
-        # build via advanced indexing
-        bidx = torch.arange(B, device=device).view(B, 1).expand(B, C)
-        nidx = torch.arange(C, device=device).view(1, C).expand(B, C)
-        pk = path_key.clone()
-        pk[bidx[valid_cur], nidx[valid_cur], col[valid_cur]] = cur[valid_cur]
-        path_key = pk
+        col = torch.where(
+            valid_cur,
+            (cur_depth - 1).clamp(min=0, max=D - 1),
+            torch.full_like(cur_depth, D),   # dumpster column
+        )
+        val = torch.where(valid_cur, cur, torch.full_like(cur, -1))
+        path_key.scatter_(2, col.unsqueeze(2), val.unsqueeze(2))
         # step up to parent
-        par = torch.gather(cand_parent_cidx, 1, slot)  # parent slot of each node's chain head
-        # advance cur to its parent
-        parent_of_cur = torch.where(cur >= 0, torch.gather(cand_parent_cidx, 1, cur.clamp(min=0)), torch.full_like(cur, -1))
-        parent_of_cur = torch.where(cur >= 0, parent_of_cur, torch.full_like(cur, -1))
+        parent_of_cur = torch.where(
+            valid_cur,
+            torch.gather(cand_parent_cidx, 1, cur.clamp(min=0)),
+            torch.full_like(cur, -1),
+        )
         cur = parent_of_cur
         cur_depth = (cur_depth - 1).clamp(min=0)
+    path_key = path_key[:, :, :D]
     # closed candidates sort by path_key ascending (lexicographic over columns);
     # unclosed -> large sentinel so they fall to the end.
     BIG = C + 1
-    sortable = path_key.clone()
-    # replace -1 with -1 (parent-first) is already correct; mask unclosed rows to BIG.
     unclosed = ~closed
-    sortable[unclosed] = BIG
+    sortable = torch.where(unclosed.unsqueeze(2), torch.full_like(path_key, BIG), path_key)
     # lexsort over D columns: stable sorts from last column to first.
     order2 = torch.arange(C, device=device).unsqueeze(0).expand(B, C).clone()
     for col in range(D - 1, -1, -1):
@@ -407,29 +419,40 @@ def tensor_tree_from_eagle_candidate_tensors(
     token = torch.full((B, max_nodes), pad_token_id, dtype=torch.long, device=device)
     parent_idx = torch.full((B, max_nodes), -1, dtype=torch.long, device=device)
     depth = torch.zeros((B, max_nodes), dtype=torch.long, device=device)
-    n_nodes = torch.ones(B, dtype=torch.long, device=device)
+    n_nodes = draft_count + 1
     token[:, 0] = root_tokens.to(device)
 
-    # cand slot -> node index map (node 0 = root). Build per row.
+    # cand slot -> node index map (node 0 = root): order2 is a permutation, so
+    # scattering ranks 1..draft_count along it is collision-free.
+    rank = torch.arange(C, device=device).unsqueeze(0).expand(B, C)  # [B, C]
+    node_rank = torch.where(
+        rank < draft_count.unsqueeze(1), rank + 1, torch.full_like(rank, -1)
+    )
     cand_to_node = torch.full((B, C), -1, dtype=torch.long, device=device)
-    for b in range(B):
-        dc = int(draft_count[b].item())
-        if dc == 0:
-            n_nodes[b] = 1
-            continue
-        ordered = order2[b, :dc]  # candidate slots in DFS order
-        node_indices = torch.arange(1, dc + 1, device=device)
-        cand_to_node[b, ordered] = node_indices
-        token[b, 1:dc + 1] = cand_token[b, ordered]
-        depth[b, 1:dc + 1] = cand_depth[b, ordered]
-        # parent node index: 0 if parent is root, else cand_to_node[parent slot]
-        par_slots = cand_parent_cidx[b, ordered]  # [-1 means root]
-        par_nodes = torch.where(par_slots < 0, torch.zeros_like(par_slots), cand_to_node[b, par_slots.clamp(min=0)])
-        parent_idx[b, 1:dc + 1] = par_nodes
-        n_nodes[b] = dc + 1
+    cand_to_node.scatter_(1, order2, node_rank)
+
+    if max_draft > 0:
+        ordered = order2[:, :max_draft]                              # [B, max_draft]
+        valid_rank = rank[:, :max_draft] < draft_count.unsqueeze(1)  # [B, max_draft]
+        tok_rows = torch.gather(cand_token, 1, ordered)
+        dep_rows = torch.gather(cand_depth, 1, ordered)
+        par_slots = torch.gather(cand_parent_cidx, 1, ordered)       # -1 -> root
+        par_nodes = torch.where(
+            par_slots < 0,
+            torch.zeros_like(par_slots),
+            torch.gather(cand_to_node, 1, par_slots.clamp(min=0)),
+        )
+        token[:, 1:] = torch.where(
+            valid_rank, tok_rows, torch.full_like(tok_rows, pad_token_id)
+        )
+        depth[:, 1:] = torch.where(valid_rank, dep_rows, torch.zeros_like(dep_rows))
+        parent_idx[:, 1:] = torch.where(
+            valid_rank, par_nodes, torch.full_like(par_nodes, -1)
+        )
 
     return TensorTreeBatch(token=token, parent_idx=parent_idx, depth=depth,
-                           n_nodes=n_nodes, device=device, max_nodes=max_nodes)
+                           n_nodes=n_nodes, device=device, max_nodes=max_nodes,
+                           max_depth_host=int(max_candidate_depth))
 
 
 def parent_pos_list_per_row(tt: TensorTreeBatch) -> List[List[int]]:
@@ -447,3 +470,107 @@ def parent_pos_list_per_row(tt: TensorTreeBatch) -> List[List[int]]:
             row.append(-1 if pidx == 0 else pidx - 1)  # -> parent position_in_sequence
         out.append(row)
     return out
+
+
+def local_tree_mask_from_tensor_tree(tt: TensorTreeBatch, device: torch.device) -> torch.Tensor:
+    """Vectorized [B, I, I] local root/tree adjacency (I = max_nodes), identical
+    to the per-row assembly in ``prepare_incremental_tree_batch(...,
+    return_local_tree_mask=True)``: root attends itself; each valid draft node
+    attends the root, itself, and its strict draft-space ancestors; padding
+    rows/cols stay all-False.
+
+    Replaces the per-row Python `while` parent-walk
+    (`build_tree_attention_mask_with_root`) with a depth-bounded pointer walk in
+    node space (max depth hops, each one [B, N] gather + scatter). One host sync
+    total (max draft depth to bound the hop count).
+    """
+    B = tt.batch_size
+    N = tt.max_nodes
+    parent_idx = tt.parent_idx.to(device)
+    n_nodes = tt.n_nodes.to(device)
+    node_ar = torch.arange(N, device=device).unsqueeze(0)           # [1, N]
+    alive = node_ar < n_nodes.unsqueeze(1)                          # [B, N]
+
+    mask = torch.zeros(B, N, N, dtype=torch.bool, device=device)
+    mask[:, 0, 0] = True
+    if N <= 1:
+        return mask
+
+    # Ancestor closure in NODE space: anc[b, i, a] == True iff a is a strict
+    # ancestor of i. Chains only traverse valid parent links (padding slots have
+    # parent -1 and are never a valid node's parent), so no validity masking is
+    # needed on the walk itself.
+    par = torch.where(alive, parent_idx, torch.full_like(parent_idx, -1))
+    anc = torch.zeros(B, N, N, dtype=torch.bool, device=device)
+    cur = par
+    max_hops = int(tt.depth.to(device).masked_fill(~alive, 0).max().item())
+    for _ in range(max_hops):
+        valid = cur >= 0
+        # Fresh one-hot per hop (never write False over accumulated True).
+        one_hot = torch.zeros(B, N, N, dtype=torch.bool, device=device)
+        one_hot.scatter_(2, cur.clamp(min=0).unsqueeze(2), valid.unsqueeze(2))
+        anc |= one_hot
+        nxt = par.gather(1, cur.clamp(min=0))
+        cur = torch.where(valid, nxt, torch.full_like(cur, -1))
+
+    draft_valid = alive[:, 1:]                                      # [B, N-1]
+    eye = torch.eye(N - 1, dtype=torch.bool, device=device).unsqueeze(0)
+    tree_block = (anc[:, 1:, 1:] | eye) & draft_valid.unsqueeze(2) & draft_valid.unsqueeze(1)
+    mask[:, 1:, 0] = draft_valid
+    mask[:, 1:, 1:] = tree_block
+    return mask
+
+
+def prepare_incremental_tensor_tree_batch(
+    tt: TensorTreeBatch,
+    input_ids: torch.LongTensor,
+    device: torch.device,
+    pad_token_id: int = 0,
+    seq_lengths: Optional[torch.LongTensor] = None,
+    is_prefill: bool = False,
+    kv_cache_position_ids: Optional[torch.Tensor] = None,
+    return_local_tree_mask: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], List]:
+    """`prepare_incremental_tree_batch` fed directly from a TensorTreeBatch —
+    no SpeculativeTree objects, no DFS re-linearization.
+
+    * Steady-state generation (`return_local_tree_mask=True`, the hot path) is
+      fully vectorized on-device: tokens are a slice of `tt.token` and the mask
+      comes from `local_tree_mask_from_tensor_tree`.
+    * Prefill and the dense generation mask (rare/one-shot paths) reuse the
+      exact per-row branch code via `_prepare_incremental_tree_batch_impl`,
+      fed with per-row lists extracted from the tensors (one host transfer).
+    """
+    from bloombee.models.llama.spe_dec_tree import _prepare_incremental_tree_batch_impl
+
+    B = tt.batch_size
+    if B == 0 or tt.max_nodes <= 1:
+        # All rows root-only — same early-exit contract as the object path.
+        return (
+            torch.empty(B, 0, dtype=torch.long, device=device),
+            None,
+            [[] for _ in range(B)],
+        )
+
+    if return_local_tree_mask and not is_prefill:
+        tree_tokens = tt.token[:, 1:].to(device).contiguous()
+        attention_mask = local_tree_mask_from_tensor_tree(tt, device)
+        return tree_tokens, attention_mask, [[] for _ in range(B)]
+
+    n_draft = (tt.n_nodes - 1).tolist()
+    toks = tt.token[:, 1:].tolist()
+    row_tokens = [toks[b][: int(n_draft[b])] for b in range(B)]
+    row_parents = parent_pos_list_per_row(tt)
+    tree_tokens, attention_mask, _ = _prepare_incremental_tree_batch_impl(
+        row_tokens,
+        row_parents,
+        [[] for _ in range(B)],
+        input_ids,
+        device,
+        pad_token_id=pad_token_id,
+        seq_lengths=seq_lengths,
+        is_prefill=is_prefill,
+        kv_cache_position_ids=kv_cache_position_ids,
+        return_local_tree_mask=return_local_tree_mask,
+    )
+    return tree_tokens, attention_mask, [[] for _ in range(B)]

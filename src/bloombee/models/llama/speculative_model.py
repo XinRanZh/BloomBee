@@ -20,11 +20,19 @@ from bloombee.models.llama.spec_decoding_drafter import MultiSSMDrafter
 from bloombee.models.llama.spec_decoding_verify import verify_path
 from bloombee.models.llama.spe_dec_tree import SpeculativeTree, TreeNode, prepare_incremental_tree_batch
 from bloombee.models.llama.tensor_tree import (
+    TensorTreeBatch,
     tensor_tree_from_speculative_trees,
     greedy_verify_tensorized,
+    prepare_incremental_tensor_tree_batch,
 )
 
 _TENSOR_TREE_ENABLED = os.environ.get("BLOOMBEE_TENSOR_TREE", "0").strip().lower() in ("1", "true", "on", "yes")
+
+# Per-round phase profiler (draft / forward_rpc / extract / other), emitted as
+# ROUND_PROF* log lines for shard-style time-decomposition receipts. When on,
+# phase boundaries are CUDA-synchronized so draft/extract times reflect
+# completed GPU work, not just kernel-enqueue time. Diagnostics only.
+_ROUND_PROF_ENABLED = os.environ.get("BLOOMBEE_SD_ROUND_PROFILE", "0").strip().lower() in ("1", "true", "on", "yes")
 
 from bloombee.client.remote_generation import RemotePastKeyValues
 from bloombee.client.inference_session import InferenceSession
@@ -444,8 +452,15 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             # prefix cache; it is rebuilt deterministically on the first round.
             if hasattr(drafter, "reorder_prefix_states"):
                 drafter.reorder_prefix_states([])
+        # Per-round profiler state (ROUND_PROF); cheap no-ops when disabled.
+        _rp_draft_ms = 0.0
+        _rp_b_active = batch_size
+        _rp_nodes_sum = 0
+        _rp_nodes_max = 0
         while not finished and bool(((seq_lengths - initial_seq_lengths) < row_max_new).any().item()):
             # 1. Build speculative trees using SSM - pass per-sample seq_lengths
+            if _ROUND_PROF_ENABLED and device.type == "cuda":
+                torch.cuda.synchronize(device)
             t1 = time.perf_counter()
             # Pass EAGLE-2-style tree-budget kwargs through to the drafter.
             # MultiSSMDrafter consumes them to do post-expansion budget pruning;
@@ -474,8 +489,39 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 spec_trees = drafter.build_trees_parallel(
                     current_input_ids, seq_lengths, beam_width, max_tree_depth,
                 )
+            # Native GPU-tree emit: the drafter produced a TensorTreeBatch
+            # instead of object trees this round (greedy batched prefix path).
+            spec_tt = None
+            if (
+                spec_trees is None
+                and _TENSOR_TREE_ENABLED
+                and not bool(getattr(generation_config, "do_sample", False))
+            ):
+                spec_tt = getattr(drafter, "last_tensor_tree", None)
+                if spec_tt is None:
+                    raise RuntimeError(
+                        "drafter returned no SpeculativeTrees and no native TensorTreeBatch"
+                    )
+            if _ROUND_PROF_ENABLED and device.type == "cuda":
+                torch.cuda.synchronize(device)
             t2 = time.perf_counter()
             logger.info(f"Step {step_idx}: Built speculative trees in {t2 - t1:.4f} seconds")
+            if _ROUND_PROF_ENABLED:
+                _rp_draft_ms = (t2 - t1) * 1000.0
+                _rp_b_active = batch_size
+                try:
+                    if spec_tt is not None:
+                        _rp_nodes_sum = int(spec_tt.n_nodes.sum().item())
+                        _rp_nodes_max = int(spec_tt.n_nodes.max().item())
+                    else:
+                        _rp_nodes = [int(getattr(_t, "total_nodes", 0) or 0) for _t in spec_trees]
+                        _rp_nodes_sum = sum(_rp_nodes)
+                        _rp_nodes_max = max(_rp_nodes) if _rp_nodes else 0
+                except Exception:
+                    _rp_nodes_sum = _rp_nodes_max = 0
+                # Tells _verify_trees_with_forward which round its DETAIL line
+                # belongs to (it has no step counter of its own).
+                self._round_prof_step = step_idx
             # logger.info(f"spec_trees, {spec_trees}")
             
             # Active-row compaction: ship the pending KV row-gather with this
@@ -507,6 +553,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 seq_lengths=seq_lengths,
                 do_sample=bool(getattr(generation_config, "do_sample", False)),
                 temperature=float(getattr(generation_config, "temperature", 1.0) or 1.0),
+                tt=spec_tt,
             )
             if pending_row_perm is not None:
                 # The gather has been applied by every server on this step;
@@ -654,6 +701,17 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             finished = unfinished_sequences.max() == 0
             total_time = time.perf_counter() - t1
             logger.info(f"Step {step_idx}: FTotal Time Elapsed={total_time:.4f} seconds")
+            if _ROUND_PROF_ENABLED:
+                try:
+                    _rp_committed = int((valid_lengths + append_llm_token).to(torch.long).sum().item())
+                except Exception:
+                    _rp_committed = -1
+                logger.info(
+                    f"Step {step_idx}: ROUND_PROF draft_ms={_rp_draft_ms:.2f} "
+                    f"verify_plus_ms={(t3 - t2) * 1000.0:.2f} total_ms={total_time * 1000.0:.2f} "
+                    f"b_active={_rp_b_active} tree_nodes_sum={_rp_nodes_sum} "
+                    f"tree_nodes_max={_rp_nodes_max} committed={_rp_committed}"
+                )
             current_generations = seq_lengths - initial_seq_lengths
             for i in range(batch_size):
                 orig_i = row_origin[i]
@@ -856,7 +914,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         self,
         input_ids: torch.LongTensor,
         llm_generated_token: torch.Tensor,
-        trees: List[SpeculativeTree],
+        trees: Optional[List[SpeculativeTree]],
         drafter: Optional[Any],
         logits_processor: LogitsProcessorList,
         past_key_values: RemotePastKeyValues,
@@ -866,6 +924,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         seq_lengths: torch.LongTensor,
         do_sample: bool = False,
         temperature: float = 1.0,
+        tt: Optional[TensorTreeBatch] = None,
     ) -> Tuple[
         Optional[torch.LongTensor],
         torch.Tensor,
@@ -892,16 +951,37 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             not is_first_iteration
             and os.environ.get("BLOOMBEE_DISABLE_LOCAL_TREE_MASK", "0") != "1"
         )
-        tree_tokens, attention_mask, batch_node_paths = prepare_incremental_tree_batch(
-            trees,
-            input_ids,
-            input_ids.device,
-            seq_lengths=seq_lengths,
-            is_prefill=is_first_iteration,
-            kv_cache_position_ids=past_key_values.kv_cache_position_ids,
-            return_local_tree_mask=use_local_tree_mask,
-            return_node_paths=bool(do_sample),
-        )
+        # Native GPU-tree path: the drafter emitted a TensorTreeBatch directly
+        # (BLOOMBEE_TENSOR_TREE=1 + BLOOMBEE_TENSOR_TREE_EMIT=1, greedy). Skip
+        # the SpeculativeTree prepare entirely — no DFS re-linearization, no
+        # per-row Python mask walk (the local mask is built on-device).
+        use_native_tt = tt is not None and _TENSOR_TREE_ENABLED and not do_sample
+        if use_native_tt:
+            tree_tokens, attention_mask, batch_node_paths = prepare_incremental_tensor_tree_batch(
+                tt,
+                input_ids,
+                input_ids.device,
+                seq_lengths=seq_lengths,
+                is_prefill=is_first_iteration,
+                kv_cache_position_ids=past_key_values.kv_cache_position_ids,
+                return_local_tree_mask=use_local_tree_mask,
+            )
+        else:
+            if trees is None:
+                raise ValueError(
+                    "_verify_trees_with_forward requires SpeculativeTree objects "
+                    "when no native TensorTreeBatch is active"
+                )
+            tree_tokens, attention_mask, batch_node_paths = prepare_incremental_tree_batch(
+                trees,
+                input_ids,
+                input_ids.device,
+                seq_lengths=seq_lengths,
+                is_prefill=is_first_iteration,
+                kv_cache_position_ids=past_key_values.kv_cache_position_ids,
+                return_local_tree_mask=use_local_tree_mask,
+                return_node_paths=bool(do_sample),
+            )
         
         # logger.info(f"tree_tokens: {tree_tokens}, attention_mask: {attention_mask.shape}")
         # logger.info(f"attention_mask: {attention_mask}")
@@ -942,6 +1022,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         # logger.info(f"tree_mask_packed: {tree_mask_packed}")
         
         logits: Optional[torch.Tensor] = None
+        if _ROUND_PROF_ENABLED:
+            _t_fwd0 = time.perf_counter()
         with torch.no_grad():
             if not use_kv_cache:
                 # No cache: process tree tokens directly
@@ -1008,7 +1090,9 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     logits = _project_lm_head(self.lm_head, hidden_states, drafter)
                 new_past_key_values = past_key_values
                 new_past_key_values.update_seen(active_session.position)
-                
+
+        if _ROUND_PROF_ENABLED:
+            _t_fwd1 = time.perf_counter()
         # Extract verification results — also returns final_positions [B] so
         # callers can gather the committed-endpoint hidden state for EAGLE.
         if do_sample:
@@ -1027,8 +1111,11 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         elif _TENSOR_TREE_ENABLED:
             # GPU-tree migration: tensorized greedy verifier (no per-depth host
             # sync, no Python TreeNode walk). Token-identical to the Python path
-            # (validated by scripts/test_tensor_greedy_identity.py).
-            tt = tensor_tree_from_speculative_trees(trees, hidden_states.device)
+            # (validated by scripts/test_tensor_greedy_identity.py). When the
+            # drafter natively emitted the TensorTreeBatch, skip the
+            # Python-tree bridge entirely.
+            if tt is None:
+                tt = tensor_tree_from_speculative_trees(trees, hidden_states.device)
             project = lambda rows: _project_lm_head_rows(self.lm_head, rows, drafter)
             (
                 verified_tokens,
@@ -1062,6 +1149,19 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 seq_lengths=seq_lengths,
                 is_first_iteration=is_first_iteration,
                 drafter=drafter,
+            )
+        if _ROUND_PROF_ENABLED:
+            if hidden_states is not None and getattr(hidden_states, "is_cuda", False):
+                torch.cuda.synchronize(hidden_states.device)
+            _t_ext1 = time.perf_counter()
+            try:
+                _hs_shape = "x".join(str(int(s)) for s in hidden_states.shape)
+            except Exception:
+                _hs_shape = "?"
+            logger.info(
+                f"Step {getattr(self, '_round_prof_step', -1)}: ROUND_PROF_DETAIL "
+                f"forward_rpc_ms={(_t_fwd1 - _t_fwd0) * 1000.0:.2f} "
+                f"extract_ms={(_t_ext1 - _t_fwd1) * 1000.0:.2f} hidden_return={_hs_shape}"
             )
         return (
             verified_tokens,

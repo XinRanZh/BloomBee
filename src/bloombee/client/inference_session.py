@@ -24,6 +24,7 @@ from bloombee.utils.lossless_transport import (
     transport_profile_scope,
     log_transport_profile_event,
 )
+from bloombee.utils.s2s_activation_quant import dequantize_s2s_hidden_from_transport
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from bloombee.utils.packaging import normalize_arg
 from bloombee.utils.real_activation_dumper import capture_wire_activation
@@ -472,6 +473,34 @@ class _ServerInferenceSession:
             # [NETWORK_TIMING] Measure deserialization time
             deserialize_start = time.perf_counter()
             outputs = list(map(deserialize_torch_tensor, outputs_serialized.tensors))
+            # Tail->client int8 return leg: the tail server marks quantized
+            # responses via response metadata ("s2s_hidden_quant"); the fp32
+            # per-token scale rides as an appended tensor (scale_tensor_index).
+            # Restore tensor[0] to fp16 and drop the scale from the outputs.
+            if outputs and outputs_serialized.metadata:
+                try:
+                    _resp_meta = MSGPackSerializer.loads(outputs_serialized.metadata)
+                except Exception:
+                    _resp_meta = None
+                _q_meta = (
+                    _resp_meta.get("s2s_hidden_quant") if isinstance(_resp_meta, dict) else None
+                )
+                if isinstance(_q_meta, dict):
+                    _scale_idx = _q_meta.get("scale_tensor_index")
+                    _scale = (
+                        outputs[_scale_idx]
+                        if isinstance(_scale_idx, int) and 0 <= _scale_idx < len(outputs)
+                        else None
+                    )
+                    outputs[0] = dequantize_s2s_hidden_from_transport(
+                        outputs[0],
+                        _resp_meta,
+                        _scale,
+                        logger=logger,
+                        context="tail_to_client",
+                    )
+                    if _scale is not None:
+                        outputs.pop(_scale_idx)
             deserialize_end = time.perf_counter()
             deserialize_time_ms = (deserialize_end - deserialize_start) * 1000
         

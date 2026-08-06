@@ -9,6 +9,23 @@ import torch
 _QUANT_ENV = "BLOOMBEE_S2S_ACTIVATION_QUANT"
 _SPEC_ONLY_ENV = "BLOOMBEE_S2S_ACTIVATION_QUANT_SPEC_ONLY"
 _LOGS_ENV = "BLOOMBEE_S2S_ACTIVATION_QUANT_LOGS"
+_TAIL_QUANT_ENV = "BLOOMBEE_TAIL_ACTIVATION_QUANT"
+
+
+def tail_activation_quant_enabled() -> bool:
+    """Independent gate for the tail->client return leg (stream responses).
+    Same int8_per_token scheme as the S2S push leg, separate A/B switch so the
+    two legs can be measured independently.
+
+    WARNING: output-changing numerics env, NOT a lossless optimization. The
+    returned hidden feeds the client's lm_head verification logits directly,
+    so the ~0.9% quantization error flips greedy near-ties (measured: 2/32
+    rows token-identical vs fp16; deterministic per config; acceptance
+    unchanged). Never enable under a token-identity gate; report benchmark
+    results per wire mode. Applies to every response the tail stage emits
+    (SD, plain decode, and prefill) — keep it off for fp16 baselines."""
+    mode = os.environ.get(_TAIL_QUANT_ENV, "").strip().lower()
+    return mode in ("1", "true", "on", "int8", "int8_per_token")
 
 
 def s2s_activation_quant_enabled(*, is_spec_dec: bool) -> bool:
@@ -21,15 +38,10 @@ def s2s_activation_quant_enabled(*, is_spec_dec: bool) -> bool:
     return bool(is_spec_dec) or not spec_only
 
 
-def quantize_s2s_hidden_for_transport(
+def _int8_per_token_quantize(
     hidden_states: torch.Tensor,
-    *,
-    is_spec_dec: bool,
-    logger: Optional[Any] = None,
-    context: str = "",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict[str, Any]]]:
-    if not s2s_activation_quant_enabled(is_spec_dec=is_spec_dec):
-        return hidden_states, None, None
+    """Pure codec: per-token (last-dim) absmax int8 quantization. No env gate."""
     if not torch.is_floating_point(hidden_states) or hidden_states.ndim < 2:
         return hidden_states, None, None
 
@@ -48,13 +60,58 @@ def quantize_s2s_hidden_for_transport(
         "orig_shape": original_shape,
         "scale_shape": [int(dim) for dim in scale_tensor.shape],
     }
+    return quantized, scale_tensor, quant_meta
+
+
+def quantize_s2s_hidden_for_transport(
+    hidden_states: torch.Tensor,
+    *,
+    is_spec_dec: bool,
+    logger: Optional[Any] = None,
+    context: str = "",
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict[str, Any]]]:
+    if not s2s_activation_quant_enabled(is_spec_dec=is_spec_dec):
+        return hidden_states, None, None
+    quantized, scale_tensor, quant_meta = _int8_per_token_quantize(hidden_states)
+    if quant_meta is None:
+        return hidden_states, None, None
     if logger is not None and os.environ.get(_LOGS_ENV, "0") == "1":
+        original_shape = quant_meta["orig_shape"]
         raw_bytes = int(hidden_states.numel() * hidden_states.element_size())
         quant_bytes = int(quantized.numel() * quantized.element_size() + scale_tensor.numel() * scale_tensor.element_size())
         logger.info(
             "[S2S_ACTIVATION_QUANT] context=%s scheme=int8_per_token shape=%s raw_bytes=%s quant_bytes=%s ratio=%.4f",
             context,
             tuple(original_shape),
+            raw_bytes,
+            quant_bytes,
+            quant_bytes / raw_bytes if raw_bytes > 0 else 1.0,
+        )
+    return quantized, scale_tensor, quant_meta
+
+
+def quantize_tail_hidden_for_transport(
+    hidden_states: torch.Tensor,
+    *,
+    logger: Optional[Any] = None,
+    context: str = "",
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict[str, Any]]]:
+    """Tail->client return leg: same int8_per_token codec, independent env gate
+    (BLOOMBEE_TAIL_ACTIVATION_QUANT). Returns the scale as a float32 tensor so
+    it rides the stream as an appended tensor (same mechanics as the S2S push
+    leg's scale_tensor_index), not as a float64 list in metadata."""
+    if not tail_activation_quant_enabled():
+        return hidden_states, None, None
+    quantized, scale_tensor, quant_meta = _int8_per_token_quantize(hidden_states)
+    if quant_meta is None:
+        return hidden_states, None, None
+    if logger is not None and os.environ.get(_LOGS_ENV, "0") == "1":
+        raw_bytes = int(hidden_states.numel() * hidden_states.element_size())
+        quant_bytes = int(quantized.numel() + scale_tensor.numel() * scale_tensor.element_size())
+        logger.info(
+            "[TAIL_ACTIVATION_QUANT] context=%s scheme=int8_per_token shape=%s raw_bytes=%s quant_bytes=%s ratio=%.4f",
+            context,
+            tuple(quant_meta["orig_shape"]),
             raw_bytes,
             quant_bytes,
             quant_bytes / raw_bytes if raw_bytes > 0 else 1.0,

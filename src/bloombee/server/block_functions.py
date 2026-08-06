@@ -39,7 +39,9 @@ from bloombee.utils.lossless_transport import (
 from bloombee.utils.s2s_activation_quant import (
     dequantize_s2s_hidden_from_transport,
     quantize_s2s_hidden_for_transport,
+    quantize_tail_hidden_for_transport,
     s2s_activation_quant_enabled,
+    tail_activation_quant_enabled,
 )
 from bloombee.utils.misc import DUMMY, DUMMY_INT64, is_dummy
 from bloombee.utils.real_activation_dumper import capture_wire_activation
@@ -2546,6 +2548,7 @@ async def iterate_rpc_inference(
         hidden_states_for_output = hidden_states
         output_scale_tensor = None
         output_quant_meta = None
+        tail_quant_meta = None
         if step_metadata.get("next_servers") and s2s_activation_quant_enabled(is_spec_dec=bool(is_spec_dec)):
             hidden_states_for_output, output_scale_tensor, output_quant_meta = quantize_s2s_hidden_for_transport(
                 hidden_states,
@@ -2553,6 +2556,16 @@ async def iterate_rpc_inference(
                 logger=logger,
                 context=f"rpc_inference_final:{_block_span_from_uids(requested_uids)}",
             )
+        elif not step_metadata.get("next_servers") and tail_activation_quant_enabled():
+            # Tail->client return leg: quantize here, while the tensor is still
+            # alive, so the handler never re-deserializes on the yield path.
+            hidden_states_for_output, output_scale_tensor, tail_quant_meta = quantize_tail_hidden_for_transport(
+                hidden_states,
+                logger=logger,
+                context=f"tail_to_client:{_block_span_from_uids(requested_uids)}",
+            )
+            if tail_quant_meta is None:
+                hidden_states_for_output = hidden_states
         flat_tensors = (
             ensure_tensors((hidden_states_for_output, keep_indices))
             if (not is_spec_dec or compact_spec_response)
@@ -2574,11 +2587,21 @@ async def iterate_rpc_inference(
             output_quant_meta["scale_tensor_index"] = int(len(flat_tensors))
             step_metadata["s2s_hidden_quant"] = output_quant_meta
             flat_tensors = (*flat_tensors, output_scale_tensor)
+        elif tail_quant_meta is not None:
+            if output_scale_tensor is None:
+                raise ValueError("Tail activation quantization produced metadata without a scale tensor")
+            tail_quant_meta = dict(tail_quant_meta)
+            tail_quant_meta["scale_tensor_index"] = int(len(flat_tensors))
+            # Private key: the handler pops it and forwards it to the client
+            # inside the response metadata; push metadata strips "_" keys.
+            step_metadata["_tail_hidden_quant"] = tail_quant_meta
+            flat_tensors = (*flat_tensors, output_scale_tensor)
+        hidden_is_int8 = output_quant_meta is not None or tail_quant_meta is not None
         output_debug_names = (
-            ("hidden_states_int8" if output_quant_meta is not None else "hidden_states", "keep_indices")
+            ("hidden_states_int8" if hidden_is_int8 else "hidden_states", "keep_indices")
             if (not is_spec_dec or compact_spec_response)
             else (
-                "hidden_states_int8" if output_quant_meta is not None else "hidden_states",
+                "hidden_states_int8" if hidden_is_int8 else "hidden_states",
                 "keep_indices",
                 "need_pruning_next",
                 "tree_attention_mask",
@@ -2586,14 +2609,14 @@ async def iterate_rpc_inference(
                 "draft_tokens",
             )
         )
-        if output_quant_meta is not None:
+        if hidden_is_int8:
             output_debug_names = (*output_debug_names, "hidden_states_int8_scale")
         prepared_outputs = []
         for idx, result in enumerate(flat_tensors):
             proto = output_schema[idx] if idx < len(output_schema) else None
             # The int8-quantized hidden tensor must stay int8 on the wire; do not
             # cast it back to the fp16/bf16 schema dtype.
-            skip_schema_cast = output_quant_meta is not None and idx == 0
+            skip_schema_cast = hidden_is_int8 and idx == 0
             wire_tensor, dtype_debug = _prepare_inference_output_for_wire(
                 result,
                 None if skip_schema_cast else proto,

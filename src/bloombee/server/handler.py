@@ -922,7 +922,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                     # callback here prevents handler/runtime config skew from
                     # silently disabling cross-stage overlap.
                     cross_stage_push_microbatch = _cross_stage_push_wrapper
-                    
+
                     # print('before async for output_tensors, can_push, step_metadata in iterate_rpc_inference() ') ###
                     # print_time_now('')
                     # offload_logger.info(" Start inference iteration")
@@ -1003,7 +1003,46 @@ class TransformerConnectionHandler(ConnectionHandler):
                         push_time.append(push_schedule_ms) ###
                         # print('current step push outputs task prepare time ', start_ExpertResponse_time-can_push_case_time) ###
                         # print_time_now('')
-                        yield runtime_pb2.ExpertResponse(tensors=output_tensors)
+                        # Tail->client return-leg synthetic WAN delay. The
+                        # terminal stage of a chain has no downstream
+                        # `next_servers` in its step metadata (mirrors
+                        # _push_outputs' early return); intermediate stages
+                        # skip — their stream responses are client-side
+                        # observation, not the critical path. Same
+                        # BLOOMBEE_SYNTHETIC_S2S_* model as the S2S push leg.
+                        _is_tail_step = not (
+                            isinstance(step_metadata, dict) and step_metadata.get("next_servers")
+                        )
+                        # Tail->client int8 return leg: block_functions already
+                        # quantized tensor[0] pre-serialization and left the
+                        # codec meta under a private key; forward it to the
+                        # client in the response metadata. output_tensors is
+                        # already the quantized wire form, so the synthetic
+                        # delay below prices the true wire bytes.
+                        _response_metadata = None
+                        if _is_tail_step and isinstance(step_metadata, dict):
+                            _tail_q_meta = step_metadata.pop("_tail_hidden_quant", None)
+                            if _tail_q_meta is not None:
+                                _response_metadata = MSGPackSerializer.dumps(
+                                    {"s2s_hidden_quant": _tail_q_meta}
+                                )
+                        if _is_tail_step:
+                            _ret_bytes = sum(len(t.buffer) for t in output_tensors)
+                            _ret_delay_ms = _synthetic_s2s_delay_ms(_ret_bytes)
+                            if _ret_delay_ms > 0.0:
+                                logger.info(
+                                    "[S2S_SYNTHETIC_DELAY] channel=tail_to_client step=%s payload_kb=%.2f delay_ms=%.2f",
+                                    step_,
+                                    _ret_bytes / 1024.0,
+                                    _ret_delay_ms,
+                                )
+                                await asyncio.sleep(_ret_delay_ms / 1000.0)
+                        if _response_metadata is not None:
+                            yield runtime_pb2.ExpertResponse(
+                                tensors=output_tensors, metadata=_response_metadata
+                            )
+                        else:
+                            yield runtime_pb2.ExpertResponse(tensors=output_tensors)
                         end_ExpertResponse_time=perf_counter() ###
                         response_emit_ms = (end_ExpertResponse_time - start_ExpertResponse_time) * 1000.0
                         handler_step_total_ms = (end_ExpertResponse_time - handler_step_start) * 1000.0
@@ -1892,7 +1931,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             rpc_request = runtime_pb2.ExpertRequest(uid=next_uid, tensors=next_tensors, metadata=serialized_next_metadata)
 
             if synthetic_delay_ms > 0.0:
-                logger.debug(
+                logger.info(
                     "[S2S_SYNTHETIC_DELAY] channel=full_batch blocks=%s->%s:%s payload_kb=%.2f delay_ms=%.2f",
                     sender_blocks,
                     next_start,
@@ -2443,7 +2482,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                     request_metadata["s2s_synthetic_delay_ms"] = float(synthetic_delay_ms)
                     request.metadata = MSGPackSerializer.dumps(request_metadata)
                     metadata_bytes = len(request.metadata) if request.metadata else 0
-                logger.debug(
+                logger.info(
                     "[S2S_SYNTHETIC_DELAY] channel=micro_batch mb_idx=%s to_blocks=%s payload_kb=%.2f delay_ms=%.2f",
                     mb_idx,
                     to_blocks,

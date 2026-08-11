@@ -38,6 +38,14 @@ logger = get_logger(__name__)
 # builds a StaticCache-equivalent for distributed KV).
 _FAST_GENERATE_ENABLED = os.environ.get("BLOOMBEE_FAST_GENERATE", "0") == "1"
 
+# Active-row compaction for plain (non-speculative) greedy decode: finished
+# rows leave the running batch and every server front-gathers the surviving KV
+# rows (one-shot hypo_ids permutation on the next step — the same generic
+# mechanism the spec-dec path uses). Requires the client-owned fast greedy
+# loop below, so this flag also makes plain greedy generate() fast-path
+# eligible. Greedy only; microbatch pipeline must stay off (same gate as SD).
+_AR_COMPACTION_ENABLED = os.environ.get("BLOOMBEE_ACTIVE_ROW_COMPACTION", "0") == "1"
+
 
 class RemotePastKeyValues(Cache):
     """only keeps the number of seen tokens. pretends to be a legit cache"""
@@ -233,6 +241,7 @@ class RemoteGenerationMixin(_SkipTokensMixin):
             "max_length", "max_new_tokens", "do_sample", "pad_token_id",
             "eos_token_id", "bos_token_id", "use_cache", "output_hidden_states",
             "output_attentions", "return_dict_in_generate", "past_key_values",
+            "per_row_max_new_tokens",
         }
     )
 
@@ -243,7 +252,7 @@ class RemoteGenerationMixin(_SkipTokensMixin):
         kwargs: dict,
         session: Optional[InferenceSession],
     ) -> bool:
-        if not _FAST_GENERATE_ENABLED:
+        if not (_FAST_GENERATE_ENABLED or _AR_COMPACTION_ENABLED):
             return False
         if inputs is None or not isinstance(inputs, torch.Tensor) or inputs.ndim != 2:
             return False
@@ -296,6 +305,7 @@ class RemoteGenerationMixin(_SkipTokensMixin):
         bos_token_id: Optional[int] = None,
         use_cache: Optional[bool] = None,
         past_key_values: Optional[Cache] = None,
+        per_row_max_new_tokens: Optional[List[int]] = None,
         **_ignored,
     ) -> torch.Tensor:
         """Greedy decode loop that avoids HF GenerationMixin overhead.
@@ -342,6 +352,33 @@ class RemoteGenerationMixin(_SkipTokensMixin):
 
         output = input_ids
         done = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+        orig_batch_size = batch_size
+
+        # Per-row generation quotas (plain finish condition for mixed-quota
+        # workloads); scalar max_new_tokens broadcasts to every row.
+        if per_row_max_new_tokens is not None:
+            assert len(per_row_max_new_tokens) == batch_size, (
+                f"per_row_max_new_tokens length {len(per_row_max_new_tokens)} != batch {batch_size}"
+            )
+            row_max_new = torch.tensor(
+                [int(q) for q in per_row_max_new_tokens],
+                dtype=torch.long, device=input_ids.device,
+            )
+        else:
+            row_max_new = torch.full(
+                (batch_size,), int(max_new_tokens), dtype=torch.long, device=input_ids.device
+            )
+        max_steps = int(row_max_new.max().item())
+
+        # Active-row compaction state (greedy plain decode): finished rows leave
+        # the batch; servers front-gather surviving KV rows via a one-shot
+        # hypo_ids permutation on the next step.
+        arc_enabled = _AR_COMPACTION_ENABLED and batch_size > 1
+        row_origin = list(range(batch_size))           # compacted slot -> original row
+        done_rows: Dict[int, torch.Tensor] = {}        # original row -> final row output
+        pending_row_perm: Optional[torch.Tensor] = None
+        if arc_enabled:
+            logger.info(f"[ROW_COMPACT] enabled for plain decode: batch={batch_size}")
 
         with context_manager as _sess:
             # Resume-token handling (matches the legacy path's n_prev_tokens logic).
@@ -354,31 +391,73 @@ class RemoteGenerationMixin(_SkipTokensMixin):
             else:
                 step_ids = input_ids  # Prefill with the full prompt on step 0.
 
-            for step in range(max_new_tokens):
+            gen_counts = torch.zeros(batch_size, dtype=torch.long, device=input_ids.device)
+            for step in range(max_steps):
                 hidden = embed(step_ids)               # (B, step_tokens, H)
-                hidden = layers(hidden)                # RemoteSequential → session.step
+                if pending_row_perm is not None:
+                    # Ship the pending KV row-gather with this step: every
+                    # server front-gathers the surviving rows before reading;
+                    # this step's tensors are already sliced in the same order.
+                    hidden = layers(hidden, hypo_ids=pending_row_perm)
+                    pending_row_perm = None
+                else:
+                    hidden = layers(hidden)            # RemoteSequential → session.step
                 hidden = ln_f(hidden)                  # (B, step_tokens, H)
                 logits = lm_head(hidden[:, -1:, :])    # (B, 1, V) — only last position
                 # Greedy argmax. logits.dtype may be fp16/bf16; argmax is
                 # dtype-agnostic so no cast needed.
                 next_id = logits.argmax(dim=-1)        # (B, 1)
 
+                # Rows that were ALREADY finished emit pad from here on; the
+                # finishing token itself (EOS or quota-th token) stays real.
+                prior_finished = done | (gen_counts >= row_max_new)
+                if pad_token_id is not None:
+                    next_id = torch.where(
+                        prior_finished.unsqueeze(-1), torch.full_like(next_id, pad_token_id), next_id
+                    )
                 if eos_set:
-                    # Once a sequence has emitted EOS, keep it frozen on
-                    # pad_token_id (or EOS when pad is missing) — matches
-                    # HF's behavior under `pad_token_id`.
+                    # Once a sequence has emitted EOS, keep it frozen —
+                    # matches HF's behavior under `pad_token_id`.
                     for e in eos_set:
                         done = done | next_id.squeeze(-1).eq(e)
-                    if pad_token_id is not None:
-                        next_id = torch.where(
-                            done.unsqueeze(-1), torch.full_like(next_id, pad_token_id), next_id
-                        )
 
                 output = torch.cat([output, next_id], dim=1)
                 step_ids = next_id
+                gen_counts += 1
 
-                if eos_set and bool(done.all().item()):
+                finished_now = done | (gen_counts >= row_max_new)
+                if bool(finished_now.all().item()):
                     break
+                if arc_enabled and bool(finished_now.any().item()):
+                    sel = torch.nonzero(~finished_now, as_tuple=False).squeeze(-1)
+                    for i in torch.nonzero(finished_now, as_tuple=False).squeeze(-1).tolist():
+                        orig = row_origin[i]
+                        done_rows[orig] = output[i].clone()
+                    pending_row_perm = sel.clone()
+                    output = output.index_select(0, sel)
+                    step_ids = step_ids.index_select(0, sel)
+                    done = done.index_select(0, sel)
+                    row_max_new = row_max_new.index_select(0, sel)
+                    gen_counts = gen_counts.index_select(0, sel)
+                    row_origin = [row_origin[i] for i in sel.tolist()]
+                    batch_size = len(row_origin)
+
+            # Reassemble the full batch in original row order (right-padded).
+            if done_rows or len(row_origin) != orig_batch_size:
+                full_rows: Dict[int, torch.Tensor] = dict(done_rows)
+                for i, orig in enumerate(row_origin):
+                    full_rows[orig] = output[i]
+                pad_val = pad_token_id if pad_token_id is not None else 0
+                max_w = max(int(r.shape[0]) for r in full_rows.values())
+                padded = []
+                for orig in range(orig_batch_size):
+                    r = full_rows[orig]
+                    if int(r.shape[0]) < max_w:
+                        r = torch.cat(
+                            [r, torch.full((max_w - int(r.shape[0]),), pad_val, dtype=r.dtype, device=r.device)]
+                        )
+                    padded.append(r)
+                output = torch.stack(padded, dim=0)
 
             # Keep the session's output_ids consistent with the legacy path.
             _sess.output_ids = output

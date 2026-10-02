@@ -14,7 +14,9 @@ when mining is enabled:
 
 * Every eligible projection is computed as a W7A7 GEMM (int7 per-output-channel
   weights, int7 per-token activations, block-Hadamard rotation for outliers),
-  so a server's numerics do not depend on the batch shape.
+  so a server's numerics do not depend on the batch shape. GPU-resident weights
+  are quantized when the block is loaded and their originals are freed
+  (``pack_resident_weights``); offloaded weights are quantized after each copy.
 * GEMMs whose token count reaches ``min_tokens`` (and whose shape satisfies
   Pearl's consensus rules) run as NoisyGEMM and may find a block; the rest run
   as plain int7 GEMM. Noising costs O(n * k * rank) per call, so it only pays
@@ -517,8 +519,10 @@ def _get_packed_weight(weight: torch.Tensor) -> Optional[PackedInt7Weight]:
     those copies bump ``weight._version``, which forces a re-pack.
     """
     cached = getattr(weight, _PACKED_ATTR, None)
-    if cached is not None and cached[0] == weight._version:
+    if cached is not None and (weight.is_meta or cached[0] == weight._version):
         return cached[1]
+    if weight.is_meta:
+        raise RuntimeError("Weight storage was freed but no int7 packing is attached to it")
     hb = _config.hadamard_block_size
     n, k = weight.shape
     if k % GEMM_K_ALIGN != 0 or n % GEMM_N_ALIGN != 0 or (hb and k % hb != 0):
@@ -530,25 +534,61 @@ def _get_packed_weight(weight: torch.Tensor) -> Optional[PackedInt7Weight]:
     return packed
 
 
+def pack_resident_weights(weights, compute_device) -> int:
+    """Quantize FlexGen weights that live on ``compute_device`` to int7 and free their original storage.
+
+    Each eligible ``TorchTensor`` keeps its shape and dtype metadata, but its ``data`` becomes a
+    storage-less meta tensor carrying the int7 packing, so the original fp16/bf16 weight no longer
+    occupies GPU memory. Weights homed elsewhere (offloaded to CPU/disk, or FlexGen-compressed) are
+    left untouched and get packed after each copy to the GPU instead. Returns the number of bytes freed.
+    """
+    if _config is None:
+        return 0
+    freed = 0
+    for weight in weights:
+        data = weight.data
+        if weight.device is not compute_device or not isinstance(data, torch.Tensor) or data.dim() != 2:
+            continue
+        if data.is_meta:
+            continue  # already packed
+        packed = _get_packed_weight(data)
+        if packed is None:
+            continue
+        stub = torch.empty(data.shape, dtype=data.dtype, device="meta")
+        setattr(stub, _PACKED_ATTR, (stub._version, packed))
+        freed += data.numel() * data.element_size()
+        weight.data = stub
+    return freed
+
+
 def pearl_linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Drop-in for ``F.linear`` that mines Pearl on eligible projections when mining is enabled."""
     config = _config
-    if config is None or weight.dim() != 2 or x.dtype not in (torch.float16, torch.bfloat16):
-        return F.linear(x, weight, bias)
-    if config.uses_kernels and not x.is_cuda:
-        return F.linear(x, weight, bias)
+    if not weight.is_meta:
+        if config is None or weight.dim() != 2 or x.dtype not in (torch.float16, torch.bfloat16):
+            return F.linear(x, weight, bias)
+        if config.uses_kernels and not x.is_cuda:
+            return F.linear(x, weight, bias)
     packed = _get_packed_weight(weight)
-    if packed is None or x.numel() == 0:
+    if packed is None:
         return F.linear(x, weight, bias)
 
-    if config.mode == PearlMiningMode.SIMULATE:
-        out = reference_w7a7_linear(x, packed)
-        _record_gemm(x.numel() // packed.in_features, packed.out_features, packed.in_features, False)
-    else:
+    use_kernels = (
+        config is not None
+        and config.uses_kernels
+        and x.is_cuda
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x.numel() > 0
+    )
+    if use_kernels:
         x2 = x.reshape(-1, packed.in_features).contiguous()
         with torch.cuda.device(x.device):
             c = _get_runtime().linear(x2, packed)
         out = c.to(x.dtype).view(*x.shape[:-1], packed.out_features)
+    else:
+        # simulate mode, or an input the kernels cannot take for a weight whose original was freed
+        out = reference_w7a7_linear(x, packed)
+        _record_gemm(x.numel() // packed.in_features, packed.out_features, packed.in_features, False)
     if bias is not None:
         out = out + bias
     return out

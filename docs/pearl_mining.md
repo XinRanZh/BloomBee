@@ -8,14 +8,22 @@ requests a server takes.
 
 Mining is **off by default**. Turn it on with `--pearl_mining`.
 
+> **Enabling mining quantizes the served blocks to int7 (W7A7) and costs model quality.**
+> Pearl's consensus only accepts int7 x int7 GEMMs, so every Llama block projection on a
+> mining server (q/k/v/o, gate/up/down) is computed with int7 weights and int7 activations,
+> whether or not that particular GEMM mines. Outputs differ from an fp16/bf16 server and
+> generation quality drops, by an amount that depends on the model. Run `simulate` on your
+> model first to see if the loss is acceptable. The original weights are deleted from GPU
+> memory after quantization, so mining needs *less* weight memory, not more.
+
 ## How it works
 
 With mining enabled, the Llama-family block projections (q/k/v/o, gate/up/down)
 computed in `flexgen_utils/pytorch_backend.py` go through `bloombee.mining.pearl.pearl_linear`:
 
-1. On first use, each weight is quantized to int7 per output channel, with a
-   block-Hadamard rotation folded in (`--pearl_hadamard_block_size`, default 16) to spread
-   activation outliers. The packed copy is cached on the weight tensor.
+1. When a block is loaded, each projection weight is quantized to int7 per output channel,
+   with a block-Hadamard rotation folded in (`--pearl_hadamard_block_size`, default 16) to
+   spread activation outliers, and the original fp16/bf16 weight is freed.
 2. Activations are rotated and quantized to int7 per token by Pearl's fused kernel.
 3. If the GEMM is large enough (below), it runs as **NoisyGEMM**: the operands are noised
    with rank-128 noise seeded by the current block header, multiplied, and denoised.
@@ -82,12 +90,15 @@ The MAC share is what you earn on, compared with a dedicated miner running the s
 
 ## Effects on the swarm
 
-* Mining servers compute their blocks in W7A7, so their outputs differ slightly from fp16/bf16
-  servers. They announce `pearl_mining` in their DHT `ServerInfo` so clients can see it.
-  Older clients ignore the field.
-* GPU memory: the int8 weight copy is kept next to the original weights (+50% weight memory
-  for fp16/bf16). Reserve memory accordingly (for example with `--num_blocks`).
-* With weight offloading, a reused GPU buffer is re-quantized each time it is refilled.
-* FlexGen weight compression is decompressed before the int7 path, so combining the two
-  gives no memory saving.
+* Mining servers announce `pearl_mining` in their DHT `ServerInfo` so clients can tell which
+  servers run int7. Older clients ignore the field.
+* GPU memory: GPU-resident projection weights are stored as int8 (int7 values) plus one fp32
+  scale per output channel, about half of their fp16/bf16 size. The originals are not kept,
+  so a mining server cannot switch back to full precision without restarting.
+* Weight offloading (`--w_gpu_percent` < 100): weights homed on CPU/disk stay fp16/bf16 there
+  and are quantized again every time they are copied to the GPU, which adds work per step.
+* FlexGen weight compression (`compress_weight`) is decompressed and re-quantized on every
+  call; do not combine it with mining.
+* Projections whose shape the Pearl kernels cannot take (in_features not a multiple of 128,
+  out_features not a multiple of 8) keep their original precision.
 * Only the Llama-family FlexGen path is hooked. Other architectures run unchanged.

@@ -75,6 +75,8 @@ def main():
 
     parser.add_argument('--pearl_mining', type=str, choices=['off', 'on', 'dry_run', 'simulate'], default='off',
                         help='Mine Pearl (PRL) with the GEMMs of real inference requests (see docs/pearl_mining.md). '
+                             'Any mode other than "off" quantizes the served Llama blocks to int7 weights and '
+                             'activations, which lowers output quality. '
                              '"on" needs H100/H200, the Pearl miner packages and a running pearl-gateway; '
                              '"dry_run" runs the mining kernels without a gateway; "simulate" only reproduces '
                              'the int7 numerics in PyTorch to check output quality. Off by default.')

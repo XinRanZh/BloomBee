@@ -7,6 +7,7 @@ from bloombee.mining.pearl import (
     enable_pearl_mining,
     get_pearl_mining_stats,
     is_pearl_mining_enabled,
+    pack_resident_weights,
     pearl_linear,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "enable_pearl_mining",
     "get_pearl_mining_stats",
     "is_pearl_mining_enabled",
+    "pack_resident_weights",
     "pearl_linear",
 ]

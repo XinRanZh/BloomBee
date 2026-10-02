@@ -169,3 +169,54 @@ def test_server_info_announces_mining_mode_and_stays_backward_compatible():
     state, throughput, extra = info.to_tuple()
     del extra["pearl_mining"]  # announcement from a server without this field
     assert ServerInfo.from_tuple((state, throughput, extra)).pearl_mining is None
+
+
+def _flexgen_weights(device, *shapes):
+    from bloombee.flexgen_utils.pytorch_backend import TorchTensor
+
+    return [TorchTensor.create_from_torch((torch.randn(*s) / 16).bfloat16(), device) for s in shapes]
+
+
+def test_pack_resident_weights_is_noop_when_mining_is_off():
+    from bloombee.flexgen_utils.pytorch_backend import TorchDevice
+
+    device = TorchDevice("cpu")
+    (w,) = _flexgen_weights(device, (256, 256))
+    assert pearl.pack_resident_weights([w], device) == 0
+    assert not w.data.is_meta
+
+
+def test_pack_resident_weights_frees_originals_and_keeps_outputs():
+    from bloombee.flexgen_utils.pytorch_backend import TorchDevice
+
+    enable_pearl_mining(PearlMiningConfig(mode="simulate", stats_interval=0))
+    torch.manual_seed(0)
+    compute, other = TorchDevice("cpu"), TorchDevice("cpu")
+    gate, up, down, norm = _flexgen_weights(compute, (512, 256), (512, 256), (256, 512), (256,))
+    (offloaded,) = _flexgen_weights(other, (256, 256))
+    x = torch.randn(3, 4, 256, dtype=torch.bfloat16)
+    before = [pearl_linear(x, w.data) for w in (gate, up)]
+
+    freed = pearl.pack_resident_weights([gate, up, down, norm, offloaded], compute)
+
+    assert freed == (512 * 256 * 3) * 2  # bf16 bytes of the three projections
+    for w in (gate, up, down):
+        assert w.data.is_meta and w.shape == tuple(w.data.shape)  # metadata kept, storage gone
+    assert not norm.data.is_meta  # 1D weights are not projections
+    assert not offloaded.data.is_meta  # weights homed on another device are packed per copy instead
+    torch.testing.assert_close(pearl_linear(x, gate.data), before[0])
+    torch.testing.assert_close(pearl_linear(x, up.data), before[1])
+    assert pearl.pack_resident_weights([gate], compute) == 0  # idempotent
+
+
+def test_freed_weights_still_serve_inputs_the_kernels_cannot_take():
+    from bloombee.flexgen_utils.pytorch_backend import TorchDevice
+
+    enable_pearl_mining(PearlMiningConfig(mode="simulate"))
+    device = TorchDevice("cpu")
+    (w,) = _flexgen_weights(device, (256, 256))
+    pearl.pack_resident_weights([w], device)
+    x = torch.randn(4, 256)  # fp32 input
+    out = pearl_linear(x, w.data)
+    assert out.dtype == torch.float32 and out.shape == (4, 256)
+    torch.testing.assert_close(out, reference_w7a7_linear(x, pearl._get_packed_weight(w.data)))

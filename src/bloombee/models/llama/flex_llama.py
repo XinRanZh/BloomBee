@@ -14,6 +14,7 @@ import torch
 import torch.utils.checkpoint
 from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.llama_config import LlamaConfig, get_llama_config, download_llama_weights
+from bloombee.mining.pearl import pack_resident_weights
 from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import, general_copy, DeviceType, TorchDevice, TorchTensor, TorchDisk, \
     TorchMixedDevice
 from bloombee.flexgen_utils.utils import (GB, T, ValueHolder,
@@ -337,6 +338,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             weights[5].data.copy_(inv_freq.to(weights[5].data.dtype))
         except Exception:
             logger.warning("Could not overwrite rotary inv_freq; falling back to file contents")
+        pack_resident_weights(weights[:4], self.weight_load_dst)  # no-op unless Pearl mining is on
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):
@@ -524,6 +526,7 @@ class FLEX_LlamaMLP(LlamaMLP):
             ((h, ), dtype, path + "post_attention_layernorm.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
+        pack_resident_weights(weights[:3], self.weight_load_dst)  # no-op unless Pearl mining is on
         weight_home.store(weights)
 
     def load_weight(self, weight_home, weight_read_buf, k):

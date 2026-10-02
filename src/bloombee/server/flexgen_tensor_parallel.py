@@ -15,6 +15,7 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_m
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchMixedDevice, TorchTensor
+from bloombee.mining.pearl import pack_resident_weights
 from bloombee.flexgen_utils.llama_config import download_llama_weights
 
 logger = get_logger(__name__)
@@ -229,6 +230,7 @@ class _FlexgenLlamaShard(nn.Module):
         _load_weight_into_tensor(weights[3], path + "self_attn.o_proj.weight", col_slice=col_slice)
         _load_weight_into_tensor(weights[4], path + "input_layernorm.weight")
         _load_weight_into_tensor(weights[5], path + "self_attn.rotary_emb.inv_freq")
+        pack_resident_weights(weights[:4], self.weight_load_dst)  # no-op unless Pearl mining is on
         return tuple(weights)
 
     def _init_mlp_weights(self):
@@ -250,6 +252,7 @@ class _FlexgenLlamaShard(nn.Module):
         _load_weight_into_tensor(weights[1], path + "mlp.down_proj.weight", col_slice=col_slice)
         _load_weight_into_tensor(weights[2], path + "mlp.up_proj.weight", row_slice=row_slice)
         _load_weight_into_tensor(weights[3], path + "post_attention_layernorm.weight")
+        pack_resident_weights(weights[:3], self.weight_load_dst)  # no-op unless Pearl mining is on
         return tuple(weights)
 
     def _copy_weight_bundle(self, home_weights, compute_mask):

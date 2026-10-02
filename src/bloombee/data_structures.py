@@ -65,6 +65,8 @@ class ServerInfo:
     adapters: Sequence[str] = ()
     torch_dtype: Optional[str] = None
     quant_type: Optional[str] = None
+    # Pearl mining mode ("on", "dry_run", "simulate"); mining servers compute block projections in W7A7
+    pearl_mining: Optional[str] = None
     using_relay: Optional[bool] = None
     cache_tokens_left: Optional[pydantic.conint(ge=0, strict=True)] = None
     next_pings: Optional[Dict[str, pydantic.confloat(ge=0, strict=True)]] = None

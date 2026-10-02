@@ -64,6 +64,7 @@ from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import
+from bloombee.mining.pearl import PearlMiningConfig, PearlMiningMode, enable_pearl_mining
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d
 from bloombee.utils.microbatch_config import (
     is_microbatch_enabled,
@@ -148,6 +149,10 @@ class Server:
         use_auto_relay: bool = True,
         adapters: Sequence[str] = (),
         batch_size: int = 1,
+        pearl_mining: str = "off",
+        pearl_min_tokens: int = 1024,
+        pearl_gateway_socket: str = "/tmp/pearlgw.sock",
+        pearl_hadamard_block_size: int = 16,
         **kwargs,
     ):
         """Create a server with one or more bloom blocks. See run_server.py for documentation."""
@@ -256,6 +261,18 @@ class Server:
         if quant_type is None:
             quant_type = QuantType.NONE
         self.quant_type = quant_type
+
+        # Must happen before the throughput benchmark below so that it measures the mining GEMMs.
+        self.pearl_mining = PearlMiningMode(pearl_mining)
+        if self.pearl_mining != PearlMiningMode.OFF:
+            enable_pearl_mining(
+                PearlMiningConfig(
+                    mode=self.pearl_mining,
+                    min_tokens=pearl_min_tokens,
+                    gateway_socket_path=pearl_gateway_socket,
+                    hadamard_block_size=pearl_hadamard_block_size,
+                )
+            )
         logger.info(f"Model weights are loaded in {get_dtype_name(torch_dtype, quant_type)} format")
 
         is_multiquery_attn = self.block_config.num_key_value_groups > 1
@@ -410,6 +427,7 @@ class Server:
             adapters=tuple(adapters),
             torch_dtype=str(torch_dtype).replace("torch.", ""),
             quant_type=quant_type.name.lower(),
+            pearl_mining=None if self.pearl_mining == PearlMiningMode.OFF else self.pearl_mining.value,
             using_relay=reachable_via_relay,
             **throughput_info,
         )

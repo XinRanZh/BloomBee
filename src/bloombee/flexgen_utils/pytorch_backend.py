@@ -23,6 +23,7 @@ from transformers.activations import ACT2FN
 import logging
 from hivemind.utils import get_logger
 from bloombee.utils.debug import dprint
+from bloombee.mining.pearl import pearl_linear
 
 general_copy_compressed = TorchCompressedDevice = None
 global_cpu_device = None
@@ -694,9 +695,9 @@ class TorchDevice:
         
         hidden = rms_norm(hidden_states.data, input_layernorm.data)
         
-        q = F.linear(hidden, w_q.data)
-        k = F.linear(hidden, w_k.data)
-        v = F.linear(hidden, w_v.data)
+        q = pearl_linear(hidden, w_q.data)
+        k = pearl_linear(hidden, w_k.data)
+        v = pearl_linear(hidden, w_v.data)
         
         q = q.view(bsz, q_len, num_attention_heads, head_dim)
         k = k.view(bsz, q_len, num_kv_heads, head_dim)
@@ -728,7 +729,7 @@ class TorchDevice:
         value = torch.bmm(attn_weights, v).view(bsz, num_attention_heads, q_len, head_dim)
         value = value.transpose(1, 2).reshape(bsz, q_len, qkv_hidden_size)
 
-        value = F.linear(value, w_out.data)
+        value = pearl_linear(value, w_out.data)
         value.add_(hidden_states.data)
         
         if donate[0]: hidden_states.delete()
@@ -775,9 +776,9 @@ class TorchDevice:
         # logger.info(f"after norm, hidden states: {hidden}")
         
         # shape: (b, 1, h)
-        q = F.linear(hidden, w_q.data)
-        k = F.linear(hidden, w_k.data)
-        v = F.linear(hidden, w_v.data)
+        q = pearl_linear(hidden, w_q.data)
+        k = pearl_linear(hidden, w_k.data)
+        v = pearl_linear(hidden, w_v.data)
         
         # shape: (b, 1, n_head, head_dim) for q; (b, 1, n_kv, head_dim) for k/v
         q = q.view(b, tgt_s, n_head, head_dim)
@@ -914,7 +915,7 @@ class TorchDevice:
         # shape: (b, 1, h)
         value = value.permute(0, 2, 1, 3).contiguous().view(b, tgt_s, qkv_hidden_size)
         
-        value = F.linear(value, w_out.data)
+        value = pearl_linear(value, w_out.data)
 
         value.add_(inputs.data)
         
@@ -1084,7 +1085,7 @@ class TorchDevice:
         act_fn = ACT2FN[hidden_act]
         src_out = rms_norm(inputs.data, post_attention_layernorm.data)
         # src_out = F.layer_norm(inputs.data, (h,), weight=post_attention_layernorm.data)
-        out = F.linear(act_fn(F.linear(src_out, gate.data)) * F.linear(src_out, up.data), down.data)
+        out = pearl_linear(act_fn(pearl_linear(src_out, gate.data)) * pearl_linear(src_out, up.data), down.data)
 
         out.add_(inputs.data)
         # if donate[0]: inputs.delete()

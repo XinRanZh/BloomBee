@@ -271,6 +271,7 @@ Loads and serves transformer blocks on a peer in the swarm.
 | `--throughput` | `auto` | Reported throughput in tokens/sec; use `eval` to measure or `dry_run` to skip |
 | `--cache_dir` | — | Directory to cache downloaded model weights |
 | `--max_batch_size` | 2048 | Maximum number of tokens per forward batch |
+| `--pearl_mining` | `off` | Opt-in Pearl (PRL) mining on real inference GEMMs: `on`, `dry_run`, or `simulate` — see [docs/pearl_mining.md](docs/pearl_mining.md) |
 
 ---
 

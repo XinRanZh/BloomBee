@@ -73,6 +73,20 @@ def main():
                         help='Weight quantization type. Currently only INT8 is supported, and only for '
                              "DeepSeek-V3's MoE expert weights (~98%% of its params) -- see convert_block().")
 
+    parser.add_argument('--pearl_mining', type=str, choices=['off', 'on', 'dry_run', 'simulate'], default='off',
+                        help='Mine Pearl (PRL) with the GEMMs of real inference requests (see docs/pearl_mining.md). '
+                             '"on" needs H100/H200, the Pearl miner packages and a running pearl-gateway; '
+                             '"dry_run" runs the mining kernels without a gateway; "simulate" only reproduces '
+                             'the int7 numerics in PyTorch to check output quality. Off by default.')
+    parser.add_argument('--pearl_min_tokens', type=int, default=1024,
+                        help='Only GEMMs over at least this many tokens run as mining GEMMs; smaller ones (e.g. '
+                             'single-token decode) use the plain int7 kernel since noising would dominate their cost')
+    parser.add_argument('--pearl_gateway_socket', type=str, default='/tmp/pearlgw.sock',
+                        help='Unix socket of the local pearl-gateway that receives found blocks')
+    parser.add_argument('--pearl_hadamard_block_size', type=int, default=16,
+                        help='Block-Hadamard width used to spread activation outliers before int7 quantization; '
+                             '0 disables it')
+
     parser.add_argument('--num_handlers', type=int, default=8, required=False,
                         help='server will use this many processes to handle incoming requests')
     parser.add_argument('--prefetch_batches', type=int, default=1, required=False,
